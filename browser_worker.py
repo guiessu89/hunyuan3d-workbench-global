@@ -19,6 +19,19 @@ from hunyuan_workbench import Workbench, FACE_LABELS, digest, dump
 from site_adapters import browser_options, get_site
 
 HOME = "https://3d.hunyuan.tencent.com/"
+HEARTBEAT_TIMEOUT = 15
+
+
+def read_worker_status(root):
+    try:
+        return json.loads((Path(root) / "browser-status.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+def worker_is_responsive(status):
+    return (status.get("state") != "STOPPED"
+            and time.time() - status.get("heartbeat", 0) < HEARTBEAT_TIMEOUT)
 
 def atomic_json(path, data):
     temp = path.with_suffix('.'+uuid.uuid4().hex+'.tmp')
@@ -30,12 +43,11 @@ def start(root, site=None):
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     status = root / "browser-status.json"
-    if status.exists():
-        saved = json.loads(status.read_text(encoding="utf-8"))
-        if time.time() - saved.get("heartbeat", 0) < 15 and saved.get("state") != "STOPPED":
-            if saved.get("site", "china") != adapter.name:
-                raise ValueError("A worker for another site uses this root. Use a separate --root.")
-            return saved
+    saved = read_worker_status(root)
+    if worker_is_responsive(saved):
+        if saved.get("site", "china") != adapter.name:
+            raise ValueError("A worker for another site uses this root. Use a separate --root.")
+        return saved
     with (root / "browser-worker.log").open("a", encoding="utf-8") as log:
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), str(root)],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log,
@@ -47,26 +59,37 @@ def enqueue(root, op, job_id=None, submit=False, text=None, site=None):
     adapter = get_site(site)
     if op not in {"inspect", "run", "stop", "click_text", "hover_text", "research", "probe", "download", "studio"}:
         raise ValueError("Unsupported worker operation")
-    if job_id:
-        job = Workbench(root, site=adapter.name).get(job_id)
+    job = Workbench(root, site=adapter.name).get(job_id) if job_id else None
+    if job is not None:
         adapter.assert_job(job)
     if op == "run":
+        if job is None:
+            raise ValueError("A job id is required")
         if job["state"] not in {"PREPARED", "UPLOADING", "READY"}:
             raise ValueError("Job is already submitted or uncertain; inspect it instead")
     root = Path(root)
-    status_file=root/'browser-status.json'
-    saved=json.loads(status_file.read_text(encoding='utf-8')) if status_file.exists() else {}
-    if saved.get('state')=='STOPPED' or time.time()-saved.get('heartbeat',0)>15:
-        raise ValueError('Browser worker is not running. Run web-start before enqueueing browser work.')
+    saved = read_worker_status(root)
+    if not worker_is_responsive(saved):
+        raise ValueError("Browser worker is not running. Run web-start before enqueueing browser work.")
     if saved.get("site", "china") != adapter.name:
         raise ValueError("Worker belongs to another site. Select its site or use a separate --root.")
+    if adapter.name == "global" and not saved.get("instance_id"):
+        raise ValueError("Restart the Global browser worker to use this version.")
     queue = root / "queue"
     queue.mkdir(parents=True, exist_ok=True)
     request_id = uuid.uuid4().hex
     atomic_json(queue / (request_id + ".json"), {"id": request_id, "op": op, "job_id": job_id,
                                                  "submit": bool(submit), "text": text, "site": adapter.name,
-                                                 "worker_pid": saved.get("pid"), "created": time.time()})
+                                                 "worker_instance_id": saved.get("instance_id"), "created": time.time()})
     return {"request_id": request_id, "state": "QUEUED", "result_file": str(queue / (request_id + ".result.json"))}
+
+def request_matches_worker(request, status):
+    site = request.get("site", "china")
+    instance = status.get("instance_id")
+    return site == status.get("site", "china") and (
+        site != "global" or bool(instance and request.get("worker_instance_id") == instance)
+    )
+
 
 def poll(root, request_id):
     if not re.fullmatch(r"[a-f0-9]{32}", request_id):
@@ -74,14 +97,26 @@ def poll(root, request_id):
     root = Path(root)
     queue = root / "queue"
     result = queue / (request_id + ".result.json")
-    if result.exists():
-        return json.loads(result.read_text(encoding="utf-8"))
-    if (queue / (request_id + ".running")).exists():
-        status = root / "browser-status.json"
-        worker = json.loads(status.read_text(encoding="utf-8")) if status.exists() else {}
-        return {"request_id": request_id, "state": "RUNNING" if time.time()-worker.get("heartbeat",0)<60 else "WORKER_UNRESPONSIVE", "worker": worker}
-    if (queue / (request_id + ".json")).exists():
-        return {"request_id": request_id, "state": "QUEUED"}
+    # The queue only moves forward, through these successive filenames.
+    for suffix, state in ((".result.json", None), (".json", "QUEUED"), (".running", "RUNNING")):
+        try:
+            record = json.loads((queue / (request_id + suffix)).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        if state is None:
+            return record
+        worker = read_worker_status(root)
+        if result.is_file():
+            return json.loads(result.read_text(encoding="utf-8"))
+        if not worker_is_responsive(worker):
+            return {"request_id": request_id, "state": "WORKER_UNRESPONSIVE", "worker": worker}
+        if not request_matches_worker(record, worker):
+            return {"request_id": request_id, "state": "ERROR",
+                    "error": "Browser worker or site changed. Inspect the job before making a new request."}
+        response = {"request_id": request_id, "state": state}
+        if state == "RUNNING":
+            response["worker"] = worker
+        return response
     raise ValueError("Unknown request id")
 
 class BrowserFlow:
@@ -95,17 +130,8 @@ class BrowserFlow:
         self.guard()
         safe_url = urlsplit(self.page.url)
         if self.core.site.name == 'global':
-            from global_adapter import remaining_quota
-            body = self.page.locator('body').inner_text(timeout=5000)
-            return {
-                'url': self.core.site.origin + safe_url.path,
-                'prepared_job_id': getattr(self, 'prepared_job_id', None),
-                'remaining_quota': remaining_quota(body),
-                'buttons': self.page.get_by_role('button').filter(visible=True).all_text_contents(),
-                'file_inputs': self.page.locator('input[type=file]').evaluate_all(
-                    "es=>es.map(e=>({accept:e.accept, label:e.getAttribute('aria-label'), files:e.files?.length}))"
-                ),
-            }
+            from global_adapter import inspect_geometry
+            return inspect_geometry(self)
         self.page.screenshot(path=str(self.core.root / "browser-current.png"))
         return {"url": safe_url.scheme + "://" + safe_url.netloc + safe_url.path, "title": self.page.title(),
                 "body": self.page.locator("body").inner_text(timeout=5000)[:18000],
@@ -212,28 +238,33 @@ def worker(root):
             return
     core = Workbench(root)
     site = core.site
+    identity = {"pid": os.getpid(), "site": site.name, "instance_id": uuid.uuid4().hex}
     status_data={'state':'STARTING','detail':''}
     status_lock=threading.Lock()
     stop_heartbeat=threading.Event()
     def status(state=None, detail=""):
         with status_lock:
             if state is not None: status_data.update(state=state,detail=detail)
-            atomic_json(root / "browser-status.json", {**status_data, "heartbeat": time.time(), "pid": os.getpid(), "site": site.name})
+            atomic_json(root / "browser-status.json", {**status_data, **identity, "heartbeat": time.time()})
     def pulse():
         while not stop_heartbeat.wait(2): status()
     threading.Thread(target=pulse,daemon=True).start()
     status("STARTING")
     queue = root / "queue"
     queue.mkdir(exist_ok=True)
-    # A crashed action is never replayed: it may already have consumed quota.
-    for claim in queue.glob('*.running'):
-        result=claim.with_suffix('.result.json')
-        if result.exists(): continue
-        req=json.loads(claim.read_text(encoding='utf-8'))
-        atomic_json(result,{'state':'ERROR','request_id':req['id'],'error':'Worker interrupted. Action not replayed; inspect task identity before continuing.'})
-        if req.get('job_id'):
-            if core.get(req['job_id'])['state']=='SUBMITTING': core.transition(req['job_id'],'UNCERTAIN','Worker interrupted after submission reservation',expected='SUBMITTING')
     try:
+        # Record ambiguous reservations before writing the terminal queue result.
+        for claim in queue.glob('*.running'):
+            result = claim.with_suffix('.result.json')
+            if result.exists():
+                continue
+            req = json.loads(claim.read_text(encoding='utf-8'))
+            job_id = req.get('job_id')
+            if job_id and core.get(job_id)['state'] == 'SUBMITTING':
+                core.transition(job_id, 'UNCERTAIN', 'Worker interrupted after submission reservation',
+                                expected='SUBMITTING')
+            atomic_json(result, {'state': 'ERROR', 'request_id': req['id'],
+                                 'error': 'Worker interrupted. Action not replayed; inspect the job before continuing.'})
         with sync_playwright() as pw:
             profile = root / ("chrome-profile" if site.name == "china" else "global/chrome-profile")
             context = pw.chromium.launch_persistent_context(str(profile), headless=False,
@@ -274,10 +305,8 @@ def worker(root):
                     req = json.loads(claim.read_text(encoding="utf-8"))
                     target = None
                     try:
-                        if req.get("site", "china") != site.name:
-                            raise ValueError("SITE_MISMATCH: queued request belongs to another site")
-                        if site.name == "global" and req.get("worker_pid") != os.getpid():
-                            raise ValueError("Worker restarted. Inspect the job before making a new request.")
+                        if not request_matches_worker(req, identity):
+                            raise ValueError("Browser worker or site changed. Inspect the job before making a new request.")
                         status("BUSY", req["op"])
                         target=job_flow(req['job_id']) if req.get('job_id') else flow
                         if req["op"] == "inspect": result = target.inspect()
@@ -316,6 +345,8 @@ def worker(root):
                         except Exception:
                             pass
                     atomic_json(queue / (req["id"] + ".result.json"), response)
+                    if not running:
+                        break
                 if running:
                     import lifecycle
                     lifecycle.watch_tick(flow,job_flow)

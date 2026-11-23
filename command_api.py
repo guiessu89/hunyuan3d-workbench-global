@@ -7,7 +7,7 @@ import sys
 import time
 from hunyuan_workbench import Workbench, VERSION, VIEWS, dump, inspect_asset
 from features import capabilities, prepare_feature
-from browser_worker import start, enqueue, poll
+from browser_worker import start, enqueue, poll, read_worker_status, worker_is_responsive
 
 def request(core,action,job_id=None,wait=0,**options):
     if job_id: core.site.assert_job(core.get(job_id))
@@ -29,6 +29,7 @@ def request(core,action,job_id=None,wait=0,**options):
     while time.monotonic()<deadline:
         current=poll(core.root,result['request_id'])
         if current['state'] not in {'QUEUED','RUNNING'}: return current
+        result.update(current)
         time.sleep(.2)
     return result
 
@@ -36,10 +37,9 @@ def watches(core):
     return [json.loads(p.read_text(encoding='utf-8')) for p in (core.root/'watches').glob('hy_*.json')]
 
 def doctor(core):
-    p=core.root/'browser-status.json'
-    worker=json.loads(p.read_text(encoding='utf-8')) if p.exists() else {'state':'NOT_STARTED'}
+    worker = read_worker_status(core.root) or {'state': 'NOT_STARTED'}
     return {'site':core.site.name,'version':VERSION,'python':sys.executable,'state_root':str(core.root),'worker':worker,
-            'responsive':time.time()-worker.get('heartbeat',0)<15 and worker.get('state')!='STOPPED'
+            'responsive':worker_is_responsive(worker)
                          and worker.get('site','china')==core.site.name,
             'transport':'local file queue; persistent Chrome; stdio MCP','cloud_api':False,
             'job_count':len(core.list()),'watches':watches(core)}

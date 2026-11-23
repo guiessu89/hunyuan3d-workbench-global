@@ -4,11 +4,12 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from playwright.sync_api import sync_playwright
 
-from browser_worker import BrowserFlow
+from browser_worker import BrowserFlow, atomic_json, enqueue, poll
 from features import prepare_feature
 from global_adapter import remaining_quota
 from hunyuan_workbench import Workbench
@@ -63,6 +64,47 @@ class GlobalConfigurationTests(unittest.TestCase):
             self.assertEqual(json.loads(backup.read_text(encoding='utf-8')), saved)
             update_claude(path, python, remove=True)
             self.assertEqual(json.loads(path.read_text(encoding='utf-8')), saved)
+
+
+class GlobalQueueTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.worker = dict(site='global', pid=123, instance_id='first', state='IDLE')
+        self.update_worker()
+
+    def update_worker(self, **changes):
+        self.worker.update(heartbeat=time.time(), **changes)
+        atomic_json(self.root / 'browser-status.json', self.worker)
+
+    def enqueue_inspection(self):
+        return enqueue(self.root, 'inspect', site='global')['request_id']
+
+    def test_poll_reports_stopped_and_stale_worker_for_pending_requests(self):
+        request_id = self.enqueue_inspection()
+        self.assertEqual(poll(self.root, request_id)['state'], 'QUEUED')
+        self.update_worker(state='STOPPED')
+        self.assertEqual(poll(self.root, request_id)['state'], 'WORKER_UNRESPONSIVE')
+        self.worker.update(state='IDLE', heartbeat=time.time() - 60)
+        atomic_json(self.root / 'browser-status.json', self.worker)
+        self.assertEqual(poll(self.root, request_id)['state'], 'WORKER_UNRESPONSIVE')
+
+    def test_restarted_worker_rejects_pending_request_even_with_same_pid(self):
+        old = self.enqueue_inspection()
+        self.update_worker(instance_id='second')
+        self.assertEqual(poll(self.root, old)['state'], 'ERROR')
+        self.assertEqual(poll(self.root, self.enqueue_inspection())['state'], 'QUEUED')
+
+    def test_completed_result_survives_worker_shutdown(self):
+        request_id = self.enqueue_inspection()
+        queue = self.root / 'queue'
+        (queue / (request_id + '.json')).rename(queue / (request_id + '.running'))
+        self.assertEqual(poll(self.root, request_id)['state'], 'RUNNING')
+        result = dict(state='COMPLETE', request_id=request_id, result={'ok': True})
+        atomic_json(queue / (request_id + '.result.json'), result)
+        self.update_worker(state='STOPPED')
+        self.assertEqual(poll(self.root, request_id), result)
 
 
 class GlobalStudioFixture(unittest.TestCase):
@@ -121,6 +163,11 @@ class GlobalStudioFixture(unittest.TestCase):
         flow, job_id = self.fixture('single')
         page = flow.page
         self.assertEqual(dispatch(flow, {'action': 'run'}, job_id)['state'], 'READY')
+        form = flow.inspect()
+        self.assertTrue(form['geometry_controls_detected'])
+        self.assertEqual(form['prepared_job_id'], job_id)
+        self.assertEqual(form['remaining_quota'], 0)
+        self.assertEqual(form['file_inputs'][0]['files'], 1)
         self.assertEqual(page.evaluate('window.submits'), 0)
         with self.assertRaisesRegex(ValueError, 'QUOTA_UNAVAILABLE'):
             dispatch(flow, {'action': 'submit'}, job_id)

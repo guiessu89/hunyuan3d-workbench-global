@@ -19,6 +19,8 @@ For manual Claude Desktop registration, merge [the example entry](mcp-config.exa
 
 To uninstall a registration, run `<absolute-venv-python> -I -m mcp_config --host both --remove`. Choose a single host with `--host` if desired. Stop the worker before deleting the checkout or virtual environment. Archived jobs and Chrome profiles are stored separately.
 
+Follow the [local validation procedure](LOCAL_TESTING.md) for manual sign-in and a separate credit confirmation on Windows or macOS.
+
 ## Prepare and download a prop
 
 Use `hunyuan-workbench` from the installed environment or substitute `<absolute-venv-python> -I -m hunyuan_workbench`.

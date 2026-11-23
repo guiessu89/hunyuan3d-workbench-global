@@ -19,6 +19,29 @@ def remaining_quota(text):
     return next(iter(values)) if len(values) == 1 else None
 
 
+def inspect_geometry(flow):
+    page = flow.page
+    route = urlsplit(page.url).path.rstrip('/')
+    expected_route = urlsplit(flow.core.site.route('geometry')).path
+    modes = [label for label in ('Single Image', 'Multi-view')
+             if page.get_by_text(label, exact=True).filter(visible=True).count() == 1]
+    generate = page.get_by_role('button', name='Generate', exact=True).filter(visible=True)
+    generate_count = generate.count()
+    return {
+        'url': flow.core.site.origin + route,
+        'geometry_controls_detected': route == expected_route and bool(modes) and generate_count == 1,
+        'image_modes': modes,
+        'face_count_options': [value for value, label in FACES.items()
+                               if page.get_by_role('radio', name=label, exact=True).filter(visible=True).count() == 1],
+        'prepared_job_id': getattr(flow, 'prepared_job_id', None),
+        'remaining_quota': remaining_quota(page.locator('body').inner_text(timeout=5000)),
+        'generate_enabled': generate_count == 1 and generate.is_enabled(),
+        'file_inputs': page.locator('input[type=file]').evaluate_all(
+            "es => es.map(e => ({accept:e.accept, label:e.getAttribute('aria-label'), files:e.files?.length}))"
+        ),
+    }
+
+
 def unique_visible(locator, description):
     visible = locator.filter(visible=True)
     visible.first.wait_for(state='visible', timeout=5000)
@@ -71,7 +94,8 @@ def prepare(flow, job):
     signature = form_signature(page)
     flow.core.transition(job_id, 'READY', 'Verified Global geometry input previews and face count', expected='UPLOADING')
     flow.prepared_job_id, flow.prepared_signature = job_id, signature
-    return {'job_id': job_id, 'state': 'READY', 'submitted': False}
+    return {'job_id': job_id, 'state': 'READY', 'submitted': False,
+            'mode': job['mode'], 'views': list(job['views']), 'face_count': job['face_count']}
 
 
 def submit(flow, job_id):
