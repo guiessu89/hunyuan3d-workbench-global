@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from playwright.sync_api import Error as PlaywrightError
+
 
 class GlobalAuthError(ValueError):
     def __init__(self, code, message):
@@ -23,7 +25,11 @@ AUTH_FAILURE = re.compile(
 )
 CHALLENGE = re.compile(r'captcha|challenge', re.I)
 VERIFY = re.compile(r'captcha|verify (?:that )?you(?: are|.re) human|security verification'
-                    r'|complete (?:the )?verification|安全验证|人机验证', re.I)
+                    r'|slide to complete the puzzle|complete (?:the )?verification|安全验证|人机验证', re.I)
+
+
+def has_visible_text(surface, pattern):
+    return surface.get_by_text(pattern).filter(visible=True).count() > 0
 
 
 @dataclass(frozen=True)
@@ -83,27 +89,34 @@ class HunyuanGlobalAdapter(HunyuanChinaAdapter):
         except ValueError as error:
             raise GlobalAuthError('HUMAN_ACTION_REQUIRED',
                                   'Return to the official Global Studio in the dedicated browser.') from error
-        challenges = []
+        rate_limited = document_status == 429 or has_visible_text(page, RATE_LIMIT)
+        requires_verification = has_visible_text(page, VERIFY)
         for frame in page.frames:
-            if frame == page.main_frame:
+            if rate_limited or frame == page.main_frame:
                 continue
-            element = frame.frame_element()
-            if not element.is_visible():
-                continue
-            url = urlsplit(frame.url)
-            if CHALLENGE.search(f'{url.netloc}{url.path}') or CHALLENGE.search(element.get_attribute('title') or ''):
-                challenges.append(frame)
+            try:
+                element = frame.frame_element()
+                if not element.is_visible():
+                    continue
+                # Some verification frames use a generic title and URL.
+                rate_limited = has_visible_text(frame, RATE_LIMIT)
+                url = urlsplit(frame.url)
+                requires_verification = (requires_verification
+                                         or CHALLENGE.search(f'{url.netloc}{url.path}')
+                                         or CHALLENGE.search(element.get_attribute('title') or '')
+                                         or has_visible_text(frame, VERIFY))
+            except PlaywrightError:
+                if not frame.is_detached():
+                    raise  # Fail closed if the frame could not be inspected.
 
-        if document_status == 429 or any(
-            surface.get_by_text(RATE_LIMIT).filter(visible=True).count() for surface in (page, *challenges)
-        ):
+        if rate_limited:
             raise GlobalAuthError('AUTH_RATE_LIMITED',
                                   'Tencent is limiting attempts. Wait until Tencent allows another attempt, '
                                   'then complete verification manually in the same browser.')
-        if challenges or page.get_by_text(VERIFY).filter(visible=True).count():
+        if requires_verification:
             raise GlobalAuthError('HUMAN_ACTION_REQUIRED',
                                   'Complete Tencent verification manually in the dedicated browser.')
-        if document_status in (401, 403) or page.get_by_text(AUTH_FAILURE).filter(visible=True).count():
+        if document_status in (401, 403) or has_visible_text(page, AUTH_FAILURE):
             raise GlobalAuthError('HUMAN_ACTION_REQUIRED',
                                   'Tencent authentication failed or expired. Sign in manually in the same browser.')
         login = page.get_by_role('button', name=re.compile(r'^(log in|sign in|登录)$', re.I))

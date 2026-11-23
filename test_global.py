@@ -311,6 +311,31 @@ class GlobalStudioFixture(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'HUMAN_ACTION_REQUIRED: Complete Tencent verification'):
             flow.inspect()
 
+    def test_generic_verification_frame_detects_slider_and_rate_limit_without_navigation(self):
+        flow, job_id = self.fixture('single')
+        page = flow.page
+        page.goto(flow.core.site.home)
+        flow.auth_pause = GlobalAuthPause(flow.status)
+        requests = []
+        page.on('request', lambda request: requests.append(request.url))
+        page.locator('body').evaluate("""body => {
+            const frame = document.createElement('iframe');
+            frame.title = 'Verification';
+            frame.srcdoc = '<h2>Slide to complete the puzzle</h2>';
+            body.append(frame);
+        }""")
+        challenge = page.frame_locator('iframe')
+        challenge.get_by_text('Slide to complete the puzzle', exact=True).wait_for()
+        with self.assertRaisesRegex(ValueError, 'HUMAN_ACTION_REQUIRED: Complete Tencent verification'):
+            flow.inspect()
+        challenge.locator('body').evaluate(
+            """body => body.insertAdjacentHTML('beforeend', '<p>Operation too often. Please retry later.</p>')""")
+        with self.assertRaisesRegex(ValueError, 'AUTH_RATE_LIMITED'):
+            flow.auth_pause.check(flow, inspecting=True)
+        self.assertEqual(flow.auth_pause.error.code, 'AUTH_RATE_LIMITED')
+        self.assertEqual(self.core.get(job_id)['state'], 'PREPARED')
+        self.assertEqual(requests, [])
+
     def test_auth_block_leaves_running_job_and_watch_unchanged(self):
         flow, job_id = self.fixture('single')
         dispatch(flow, {'action': 'run'}, job_id)
