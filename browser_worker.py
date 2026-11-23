@@ -16,7 +16,7 @@ import threading
 from urllib.parse import urlsplit
 
 from hunyuan_workbench import Workbench, FACE_LABELS, digest, dump
-from site_adapters import browser_options, get_site
+from site_adapters import GlobalAuthError, browser_options, get_site
 
 HOME = "https://3d.hunyuan.tencent.com/"
 HEARTBEAT_TIMEOUT = 15
@@ -119,12 +119,66 @@ def poll(root, request_id):
         return response
     raise ValueError("Unknown request id")
 
+class GlobalAuthPause:
+    """Keep the blocked tab open and resume only after an explicit inspection."""
+
+    def __init__(self, status):
+        self.status = status
+        self.error = self.flow = None
+
+    def block(self, flow, error):
+        self.error, self.flow = error, flow
+        self.status(error.code, str(error))
+
+    def check(self, home, *, inspecting=False):
+        if self.error:
+            if not inspecting:
+                raise self.error
+            blocked = self.flow if not self.flow.page.is_closed() else home
+            blocked.guard()
+            if urlsplit(blocked.page.url).path.rstrip('/') != urlsplit(home.core.site.home).path:
+                raise self.error
+            if blocked is not home:
+                home.guard()
+            self.error = self.flow = None
+            self.status('IDLE')
+        else:
+            home.guard()
+
+
 class BrowserFlow:
-    def __init__(self, page, core, status_callback=lambda *args: None):
+    def __init__(self, page, core, status_callback=lambda *args: None, auth_pause=None):
         self.page, self.core, self.status = page, core, status_callback
+        self.auth_pause = auth_pause
+        self.document_status = None
+        if page is not None and core.site.name == 'global':
+            page.on('response', self.record_navigation_status)
+
+    def record_navigation_status(self, response):
+        if response.request.is_navigation_request() and response.frame == self.page.main_frame:
+            self.document_status = response.status
 
     def guard(self):
-        self.core.site.guard(self.page)
+        if self.core.site.name != 'global':
+            self.core.site.guard(self.page)
+            return
+        try:
+            self.core.site.guard(self.page, self.document_status)
+        except GlobalAuthError as error:
+            if self.auth_pause is not None:
+                self.auth_pause.block(self, error)
+            raise
+
+    def navigate(self, url, *, timeout):
+        is_global = self.core.site.name == 'global'
+        try:
+            self.page.goto(url, wait_until='domcontentloaded', timeout=timeout)
+        except Exception:
+            if is_global and not self.page.is_closed() and self.page.url != 'about:blank':
+                self.guard()
+            raise
+        if is_global:
+            self.guard()
 
     def inspect(self):
         self.guard()
@@ -270,29 +324,41 @@ def worker(root):
             context = pw.chromium.launch_persistent_context(str(profile), headless=False,
                 viewport={"width": 1440, "height": 1000}, accept_downloads=True, **browser_options())
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto(site.home, wait_until="domcontentloaded", timeout=45000)
-            flow = BrowserFlow(page, core, status)
+            auth_pause = GlobalAuthPause(status) if site.name == 'global' else None
+            flow = BrowserFlow(page, core, status, auth_pause)
+            try:
+                if auth_pause is not None and page.url not in ('about:blank', 'chrome://newtab/'):
+                    # A restored login or challenge tab belongs to the user.
+                    flow.guard()
+                flow.navigate(site.home, timeout=45000)
+                status("READY", "Dedicated Chrome is open; complete first sign-in there")
+            except GlobalAuthError:
+                pass  # Keep the browser and its profile open for manual verification.
             job_flows={}
             def job_flow(job_id):
+                if auth_pause is not None:
+                    auth_pause.check(flow)
                 if job_id in job_flows and not job_flows[job_id].page.is_closed(): return job_flows[job_id]
                 from lifecycle import read_binding
                 job=flow.core.get(job_id)
                 site.assert_job(job)
                 route=site.validate_url(read_binding(flow,job_id).get('route') or site.route(job.get('feature','geometry')))
-                target=BrowserFlow(context.new_page(),flow.core,status)
+                target=BrowserFlow(context.new_page(),flow.core,status,auth_pause)
+                job_flows[job_id]=target
                 try:
-                    target.page.goto(route,wait_until='domcontentloaded',timeout=30000)
+                    target.navigate(route, timeout=30000)
+                except GlobalAuthError:
+                    raise  # Keep this tab open for manual verification.
                 except Exception:
                     target.page.close()
                     raise
-                job_flows[job_id]=target
                 return target
-            status("READY", "Dedicated Chrome is open; complete first sign-in there")
             running = True
             heartbeat = 0
             while running and not page.is_closed():
                 if time.monotonic() - heartbeat > 2:
-                    status("IDLE")
+                    if auth_pause is None or auth_pause.error is None:
+                        status("IDLE")
                     heartbeat = time.monotonic()
                 for source in sorted(queue.glob("*.json"), key=lambda p: p.stat().st_mtime_ns):
                     if source.name.endswith(".result.json"):
@@ -307,6 +373,8 @@ def worker(root):
                     try:
                         if not request_matches_worker(req, identity):
                             raise ValueError("Browser worker or site changed. Inspect the job before making a new request.")
+                        if auth_pause is not None and req["op"] != "stop":
+                            auth_pause.check(flow, inspecting=req["op"] == "inspect")
                         status("BUSY", req["op"])
                         target=job_flow(req['job_id']) if req.get('job_id') else flow
                         if req["op"] == "inspect": result = target.inspect()
@@ -337,7 +405,16 @@ def worker(root):
                         else: raise ValueError("Unknown operation")
                         response = {"state": "COMPLETE", "request_id": req["id"], "result": result}
                     except Exception as error:
+                        if auth_pause is not None and target is not None and not isinstance(error, GlobalAuthError):
+                            try:
+                                target.guard()
+                            except GlobalAuthError as auth_error:
+                                error = auth_error
+                            except Exception:
+                                pass  # Keep the original error if the page is unavailable.
                         response = {"state": "ERROR", "request_id": req["id"], "error": str(error)[:4000]}
+                        if isinstance(error, GlobalAuthError):
+                            response["code"] = error.code
                         try:
                             if site.name == 'china' and target is not None:
                                 target.page.screenshot(path=str(queue / (req["id"] + "-error.png")))
@@ -347,7 +424,7 @@ def worker(root):
                     atomic_json(queue / (req["id"] + ".result.json"), response)
                     if not running:
                         break
-                if running:
+                if running and (auth_pause is None or auth_pause.error is None):
                     import lifecycle
                     lifecycle.watch_tick(flow,job_flow)
                 if not page.is_closed(): page.wait_for_timeout(200)

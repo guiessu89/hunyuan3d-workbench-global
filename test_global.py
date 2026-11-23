@@ -9,11 +9,11 @@ import unittest
 
 from playwright.sync_api import sync_playwright
 
-from browser_worker import BrowserFlow, atomic_json, enqueue, poll
+from browser_worker import BrowserFlow, GlobalAuthPause, atomic_json, enqueue, poll
 from features import prepare_feature
 from global_adapter import remaining_quota
 from hunyuan_workbench import Workbench
-from lifecycle import tick
+from lifecycle import tick, watch_tick
 from mcp_config import NAME, update_claude
 from site_adapters import get_site
 from studio_adapter import dispatch
@@ -199,12 +199,92 @@ class GlobalStudioFixture(unittest.TestCase):
 
     def test_login_route_blocks_before_upload(self):
         flow, job_id = self.fixture('single')
-        flow.page.route('**/studio/creation/role/geo', lambda req: req.fulfill(
-            content_type='text/html',
-            body='<script>history.replaceState(null, "", "/login")</script><button>Start Using</button>'))
-        with self.assertRaisesRegex(ValueError, 'HUMAN_ACTION_REQUIRED'):
-            dispatch(flow, {'action': 'run'}, job_id)
+        requests = []
+
+        def show_login(request):
+            requests.append(request.request.url)
+            request.fulfill(content_type='text/html',
+                            body='<script>history.replaceState(null, "", "/login")</script><button>Start Using</button>')
+
+        flow.page.route('**/studio/creation/role/geo', show_login)
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, 'HUMAN_ACTION_REQUIRED'):
+                dispatch(flow, {'action': 'run'}, job_id)
+        self.assertEqual(len(requests), 1)
         self.assertEqual(self.core.get(job_id)['state'], 'PREPARED')
+
+    def test_captcha_rate_limit_pauses_until_manual_resolution_and_inspection(self):
+        flow, job_id = self.fixture('single')
+        states = []
+        pause = GlobalAuthPause(lambda state, detail='': states.append(state))
+        flow.auth_pause = pause
+        page = flow.page
+        page.route('**/captcha', lambda req: req.fulfill(
+            content_type='text/html', body='<p>Operation too often. Please retry later.</p>'))
+        page.goto(flow.core.site.home)
+        page.locator('body').evaluate(
+            """e => e.insertAdjacentHTML('beforeend','<iframe title="Tencent CAPTCHA" src="/captcha"></iframe>')""")
+        page.frame_locator('iframe').get_by_text('Operation too often. Please retry later.').wait_for()
+        before = self.core.get(job_id)
+        with self.assertRaisesRegex(ValueError, 'AUTH_RATE_LIMITED'):
+            pause.check(flow)
+        with self.assertRaisesRegex(ValueError, 'AUTH_RATE_LIMITED'):
+            pause.check(flow, inspecting=True)
+        self.assertEqual(states[-1], 'AUTH_RATE_LIMITED')
+        self.assertFalse(page.is_closed())
+        self.assertEqual(self.core.get(job_id), before)
+        page.locator('iframe').evaluate('e => e.remove()')  # Simulate completion outside the worker.
+        with self.assertRaisesRegex(ValueError, 'AUTH_RATE_LIMITED'):
+            pause.check(flow)
+        pause.check(flow, inspecting=True)
+        self.assertIsNone(pause.error)
+        self.assertEqual(states[-1], 'IDLE')
+
+    def test_rate_limit_http_status_without_ui_message(self):
+        flow, job_id = self.fixture('single')
+        flow.page.route('**/studio/creation/role/geo', lambda req: req.fulfill(
+            status=429, content_type='text/html', body='<p>Please wait.</p>'))
+        flow.page.goto(flow.core.site.home)
+        with self.assertRaisesRegex(ValueError, 'AUTH_RATE_LIMITED'):
+            flow.inspect()
+        self.assertEqual(self.core.get(job_id)['state'], 'PREPARED')
+        flow.page.unroute('**/studio/creation/role/geo')
+        flow.page.goto(flow.core.site.home)
+        self.assertTrue(flow.inspect()['geometry_controls_detected'])
+
+    def test_verification_and_auth_failure_are_distinct_from_rate_limits(self):
+        flow, _ = self.fixture('single')
+        flow.page.goto(flow.core.site.home)
+        for message in ('Security verification', 'Login failed', 'Your session has expired'):
+            with self.subTest(message=message):
+                flow.page.set_content(f'<div role="alert">{message}</div>')
+                with self.assertRaisesRegex(ValueError, 'HUMAN_ACTION_REQUIRED'):
+                    flow.inspect()
+
+    def test_visible_challenge_frame_requires_manual_action_but_hidden_frame_does_not(self):
+        flow, _ = self.fixture('single')
+        page = flow.page
+        page.goto(flow.core.site.home)
+        page.locator('body').evaluate(
+            """e => e.insertAdjacentHTML('beforeend','<iframe title="Tencent CAPTCHA" hidden></iframe>')""")
+        self.assertTrue(flow.inspect()['geometry_controls_detected'])
+        page.locator('iframe').evaluate('e => e.hidden = false')
+        with self.assertRaisesRegex(ValueError, 'HUMAN_ACTION_REQUIRED: Complete Tencent verification'):
+            flow.inspect()
+
+    def test_auth_block_leaves_running_job_and_watch_unchanged(self):
+        flow, job_id = self.fixture('single')
+        dispatch(flow, {'action': 'run'}, job_id)
+        flow.page.locator('#quota').evaluate("e => e.textContent = 'Remaining generations: 1'")
+        self.assertEqual(dispatch(flow, {'action': 'submit'}, job_id)['state'], 'RUNNING')
+        flow.auth_pause = GlobalAuthPause(lambda *args: None)
+        flow.page.set_content('<div role="alert">Operation too often. Please retry later.</div>')
+        watch = self.core.root / 'watches' / f'{job_id}.json'
+        job, watch_record = self.core.get(job_id), watch.read_bytes()
+        watch_tick(flow)
+        self.assertEqual(flow.auth_pause.error.code, 'AUTH_RATE_LIMITED')
+        self.assertEqual(self.core.get(job_id), job)
+        self.assertEqual(watch.read_bytes(), watch_record)
 
     def test_unrecognized_new_card_never_allows_another_click(self):
         flow, job_id = self.fixture('single')

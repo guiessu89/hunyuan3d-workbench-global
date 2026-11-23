@@ -9,6 +9,7 @@ import json
 import re
 import time
 from hunyuan_workbench import dump
+from site_adapters import GlobalAuthError
 
 CARD = '#assets-container > div'
 
@@ -189,6 +190,9 @@ def watch_tick(flow, resolve_flow=None):
             data.update(last_result=result,last_check=time.time(),errors=0)
             data.pop('last_error',None);data.pop('attention_required',None)
             if result['state'] in {'FAILED','DOWNLOADED'} or (result['state']=='SUCCEEDED' and not data['auto_download']): data['enabled']=False
+        except GlobalAuthError:
+            # The worker has paused the browser queue. Keep the watch and job unchanged.
+            return
         except Exception as error:
             data.update(last_error=str(error)[:1500],last_check=time.time(),errors=data.get('errors',0)+1)
             if 'TASK_IDENTITY_REQUIRED' in str(error) or 'HUMAN_ACTION_REQUIRED' in str(error):

@@ -6,6 +6,26 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+class GlobalAuthError(ValueError):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(f'{code}: {message}')
+
+
+RATE_LIMIT = re.compile(
+    r'operation too often|too many (?:requests|(?:login |sign-in |verification )?attempts)'
+    r'|操作过于频繁|操作太频繁|请求过于频繁', re.I
+)
+AUTH_FAILURE = re.compile(
+    r'\b(?:(?:log[ -]?in|sign[ -]?in|authentication|verification) failed'
+    r'|(?:unable|failed) to (?:log|sign) in|(?:session|login) (?:has )?expired)\b'
+    r'|登录失败|登录已过期|验证失败', re.I
+)
+CHALLENGE = re.compile(r'captcha|challenge', re.I)
+VERIFY = re.compile(r'captcha|verify (?:that )?you(?: are|.re) human|security verification'
+                    r'|complete (?:the )?verification|安全验证|人机验证', re.I)
+
+
 @dataclass(frozen=True)
 class HunyuanChinaAdapter:
     name: str = 'china'
@@ -57,15 +77,38 @@ class HunyuanGlobalAdapter(HunyuanChinaAdapter):
             raise ValueError(f'UNVERIFIED_WORKFLOW: Global {feature} navigation has not been observed')
         return self.origin + '/studio/creation/role/geo'
 
-    def guard(self, page):
-        super().guard(page)
-        if urlsplit(page.url).path.rstrip('/') == '/login':
-            raise ValueError('HUMAN_ACTION_REQUIRED: sign in to Global in the dedicated browser')
+    def guard(self, page, document_status=None):
+        try:
+            self.validate_url(page.url)
+        except ValueError as error:
+            raise GlobalAuthError('HUMAN_ACTION_REQUIRED',
+                                  'Return to the official Global Studio in the dedicated browser.') from error
+        challenges = []
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            element = frame.frame_element()
+            if not element.is_visible():
+                continue
+            url = urlsplit(frame.url)
+            if CHALLENGE.search(f'{url.netloc}{url.path}') or CHALLENGE.search(element.get_attribute('title') or ''):
+                challenges.append(frame)
+
+        if document_status == 429 or any(
+            surface.get_by_text(RATE_LIMIT).filter(visible=True).count() for surface in (page, *challenges)
+        ):
+            raise GlobalAuthError('AUTH_RATE_LIMITED',
+                                  'Tencent is limiting attempts. Wait until Tencent allows another attempt, '
+                                  'then complete verification manually in the same browser.')
+        if challenges or page.get_by_text(VERIFY).filter(visible=True).count():
+            raise GlobalAuthError('HUMAN_ACTION_REQUIRED',
+                                  'Complete Tencent verification manually in the dedicated browser.')
+        if document_status in (401, 403) or page.get_by_text(AUTH_FAILURE).filter(visible=True).count():
+            raise GlobalAuthError('HUMAN_ACTION_REQUIRED',
+                                  'Tencent authentication failed or expired. Sign in manually in the same browser.')
         login = page.get_by_role('button', name=re.compile(r'^(log in|sign in|登录)$', re.I))
-        if login.filter(visible=True).count():
-            raise ValueError('HUMAN_ACTION_REQUIRED: sign in to Global in the dedicated browser')
-        if page.get_by_role('dialog').filter(has_text=re.compile(r'verify|captcha|验证', re.I)).filter(visible=True).count():
-            raise ValueError('HUMAN_ACTION_REQUIRED: complete verification manually')
+        if urlsplit(page.url).path.rstrip('/') == '/login' or login.filter(visible=True).count():
+            raise GlobalAuthError('HUMAN_ACTION_REQUIRED', 'Sign in to Global in the dedicated browser.')
 
 
 def get_site(name=None):

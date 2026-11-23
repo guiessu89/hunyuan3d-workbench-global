@@ -59,16 +59,18 @@ def generate_button(page):
 
 def prepare(flow, job):
     page, job_id = flow.page, job['id']
-    flow.prepared_job_id = None
     flow.core.site.assert_job(job)
     if job.get('feature') != 'geometry' or job.get('mode') not in {'single', 'multiview'}:
         raise ValueError('UNVERIFIED_WORKFLOW: Global supports experimental image geometry only')
     if job['state'] not in {'PREPARED', 'UPLOADING', 'READY'}:
         raise ValueError('Already submitted or uncertain. Inspect the existing task.')
-    page.goto(flow.core.site.route('geometry'), wait_until='domcontentloaded', timeout=30000)
-    flow.guard()
+    if page.url != 'about:blank':
+        flow.guard()
+    flow.prepared_job_id = None
+    flow.navigate(flow.core.site.route('geometry'), timeout=30000)
     mode = 'Single Image' if job['mode'] == 'single' else 'Multi-view'
     unique_visible(page.get_by_text(mode, exact=True), mode + ' control').click(timeout=5000)
+    flow.guard()
     if job['state'] != 'UPLOADING':
         flow.core.transition(job_id, 'UPLOADING', 'Preparing Global geometry form', expected=job['state'])
     images = page.locator('input[type=file][accept*=".png" i]')
@@ -84,6 +86,7 @@ def prepare(flow, job):
                 raise ValueError('UNVERIFIED_UI: no unique file input for ' + view)
             fields.append((field, info))
         for field, info in fields:
+            flow.guard()
             upload_image(flow, field, info)
     flow.guard()
     face = unique_visible(page.get_by_role('radio', name=FACES[job['face_count']], exact=True), 'face-count radio')
@@ -117,6 +120,7 @@ def submit(flow, job_id):
     if container.count() != 1:
         raise ValueError('UNVERIFIED_UI: no unique visible asset panel to track submission')
     before = page.locator(CARD).element_handles()
+    flow.guard()
     flow.core.transition(job_id, 'SUBMITTING', 'Reserved one click with confirmed positive visible quota', expected='READY')
     try:
         button.click(timeout=5000)
