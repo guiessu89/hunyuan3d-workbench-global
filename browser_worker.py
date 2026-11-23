@@ -150,6 +150,13 @@ class GlobalAuthPause:
                 raise self.error
             if blocked is not home:
                 home.guard()
+            from global_adapter import geometry_controls
+            modes, generate = geometry_controls(blocked.page)
+            if not modes or generate.count() != 1:
+                error = GlobalAuthError('HUMAN_ACTION_REQUIRED',
+                                        'Wait for Geometry Generation to show its image form, then run web-inspect.')
+                self.block(blocked, error)
+                raise error
             self.error = self.flow = None
             self.status('IDLE')
         else:
@@ -293,6 +300,41 @@ class BrowserFlow:
             self.core.transition(job_id, "UNCERTAIN", "Submission result ambiguous; inspect task list before any further action", expected="SUBMITTING")
             raise
 
+def resolve_job_flow(home, job_flows, job_id, *, preparing=False, inspecting=False):
+    site = home.core.site
+    if home.auth_pause is not None:
+        home.auth_pause.check(home)
+    target = job_flows.get(job_id)
+    if target is not None and target.page.is_closed():
+        target = None
+    if inspecting and site.name == 'global':
+        if target is None or target.page.url in BLANK_TABS:
+            raise ValueError('No open Studio tab for this job. Use web-inspect without a job id, or prepare the job first.')
+        return target
+    if target is not None and (site.name != 'global' or preparing or target.page.url not in BLANK_TABS):
+        return target
+
+    from lifecycle import read_binding
+    job = home.core.get(job_id)
+    site.assert_job(job)
+    if not preparing:
+        route = site.validate_url(read_binding(home, job_id).get('route') or site.route(job.get('feature', 'geometry')))
+    if target is None:
+        target = BrowserFlow(home.page.context.new_page(), home.core, home.status, home.auth_pause)
+        job_flows[job_id] = target
+    if preparing:
+        # Preparation owns its one navigation and resets the form before filling it.
+        return target
+    try:
+        target.navigate(route, timeout=30000)
+    except GlobalAuthError:
+        raise  # Keep this tab open for manual verification.
+    except Exception:
+        target.page.close()
+        raise
+    return target
+
+
 def worker(root):
     from playwright.sync_api import sync_playwright
     root = Path(root).resolve()
@@ -353,24 +395,8 @@ def worker(root):
             flow = BrowserFlow(page, core, status, auth_pause)
             flow.open_start_page()
             job_flows={}
-            def job_flow(job_id):
-                if auth_pause is not None:
-                    auth_pause.check(flow)
-                if job_id in job_flows and not job_flows[job_id].page.is_closed(): return job_flows[job_id]
-                from lifecycle import read_binding
-                job=flow.core.get(job_id)
-                site.assert_job(job)
-                route=site.validate_url(read_binding(flow,job_id).get('route') or site.route(job.get('feature','geometry')))
-                target=BrowserFlow(context.new_page(),flow.core,status,auth_pause)
-                job_flows[job_id]=target
-                try:
-                    target.navigate(route, timeout=30000)
-                except GlobalAuthError:
-                    raise  # Keep this tab open for manual verification.
-                except Exception:
-                    target.page.close()
-                    raise
-                return target
+            def job_flow(job_id, **options):
+                return resolve_job_flow(flow, job_flows, job_id, **options)
             running = True
             heartbeat = 0
             while running and not page.is_closed():
@@ -394,7 +420,10 @@ def worker(root):
                         if auth_pause is not None and req["op"] != "stop":
                             auth_pause.check(flow, inspecting=req["op"] == "inspect")
                         status("BUSY", req["op"])
-                        target=job_flow(req['job_id']) if req.get('job_id') else flow
+                        studio_request = json.loads(req.get("text") or "{}") if req["op"] == "studio" else {}
+                        preparing = site.name == 'global' and (req["op"] == "run" or studio_request.get("action") == "run")
+                        target = (job_flow(req['job_id'], preparing=preparing, inspecting=req["op"] == "inspect")
+                                  if req.get('job_id') else flow)
                         if req["op"] == "inspect": result = target.inspect()
                         elif site.name == "global" and req["op"] not in {"studio", "run", "stop"}:
                             raise ValueError("This research operation is limited to China")
@@ -418,12 +447,13 @@ def worker(root):
                             result = importlib.reload(studio_adapter).download_current(flow, req.get("text") or "glb", req.get("job_id"))
                         elif req["op"] == "studio":
                             import importlib, studio_adapter
-                            result = importlib.reload(studio_adapter).dispatch(target, json.loads(req.get("text") or "{}"), req.get("job_id"))
+                            result = importlib.reload(studio_adapter).dispatch(target, studio_request, req.get("job_id"))
                         elif req["op"] == "stop": result, running = {"state": "STOPPED"}, False
                         else: raise ValueError("Unknown operation")
                         response = {"state": "COMPLETE", "request_id": req["id"], "result": result}
                     except Exception as error:
-                        if auth_pause is not None and target is not None and not isinstance(error, GlobalAuthError):
+                        if (auth_pause is not None and target is not None and target.page.url not in BLANK_TABS
+                                and not isinstance(error, GlobalAuthError)):
                             try:
                                 target.guard()
                             except GlobalAuthError as auth_error:

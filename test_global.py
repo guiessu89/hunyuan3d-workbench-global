@@ -9,7 +9,7 @@ import unittest
 
 from playwright.sync_api import sync_playwright
 
-from browser_worker import BrowserFlow, GlobalAuthPause, atomic_json, enqueue, poll
+from browser_worker import BrowserFlow, GlobalAuthPause, atomic_json, enqueue, poll, resolve_job_flow
 from features import prepare_feature
 from global_adapter import remaining_quota
 from hunyuan_workbench import Workbench
@@ -234,6 +234,45 @@ class GlobalStudioFixture(unittest.TestCase):
         self.assertEqual(navigations, [flow.core.site.home])
         self.assertTrue(flow.inspect()['geometry_controls_detected'])
         self.assertEqual(states[-1], 'IDLE')
+
+    def test_resume_waits_for_geometry_form_even_when_studio_url_matches(self):
+        flow, job_id = self.fixture('single')
+        flow.auth_pause = GlobalAuthPause(flow.status)
+        flow.open_start_page()
+        page = flow.page
+        page.goto(flow.core.site.home)
+        page.set_content('<p role="status">Loading Studio</p>')
+        requests = []
+        page.on('request', lambda request: requests.append(request.url))
+        with self.assertRaisesRegex(ValueError, 'Wait for Geometry Generation to show its image form'):
+            flow.auth_pause.check(flow, inspecting=True)
+        with self.assertRaisesRegex(ValueError, 'HUMAN_ACTION_REQUIRED'):
+            resolve_job_flow(flow, {}, job_id, preparing=True)
+        self.assertEqual(len(page.context.pages), 1)
+        self.assertEqual(requests, [])
+        self.assertEqual(self.core.get(job_id)['state'], 'PREPARED')
+        page.set_content('<button>Single Image</button><button disabled>Generate</button>')
+        flow.auth_pause.check(flow, inspecting=True)
+        self.assertIsNone(flow.auth_pause.error)
+
+    def test_job_inspection_does_not_open_a_tab_and_preparation_navigates_once(self):
+        home, job_id = self.fixture('single')
+        home.page.goto(home.core.site.home)
+        context = home.page.context
+        navigations = []
+        context.on('request', lambda request: navigations.append(request.url) if request.is_navigation_request() else None)
+        tabs = {}
+        with self.assertRaisesRegex(ValueError, 'No open Studio tab'):
+            resolve_job_flow(home, tabs, job_id, inspecting=True)
+        self.assertEqual(len(context.pages), 1)
+        target = resolve_job_flow(home, tabs, job_id, preparing=True)
+        self.assertEqual(navigations, [])
+        self.assertEqual(dispatch(target, {'action': 'run'}, job_id)['state'], 'READY')
+        self.assertEqual(navigations, [home.core.site.home])
+        self.assertIs(resolve_job_flow(home, tabs, job_id, inspecting=True), target)
+        self.assertTrue(target.inspect()['geometry_controls_detected'])
+        self.assertEqual(navigations, [home.core.site.home])
+        self.assertEqual(target.page.evaluate('window.submits'), 0)
 
     def test_global_start_preserves_a_restored_rate_limit_page_without_reloading(self):
         flow, _ = self.fixture('single')

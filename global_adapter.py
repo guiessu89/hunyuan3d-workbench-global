@@ -19,13 +19,18 @@ def remaining_quota(text):
     return next(iter(values)) if len(values) == 1 else None
 
 
+def geometry_controls(page):
+    modes = [label for label in ('Single Image', 'Multi-view')
+             if page.get_by_text(label, exact=True).filter(visible=True).count() == 1]
+    generate = page.get_by_role('button', name='Generate', exact=True).filter(visible=True)
+    return modes, generate
+
+
 def inspect_geometry(flow):
     page = flow.page
     route = urlsplit(page.url).path.rstrip('/')
     expected_route = urlsplit(flow.core.site.route('geometry')).path
-    modes = [label for label in ('Single Image', 'Multi-view')
-             if page.get_by_text(label, exact=True).filter(visible=True).count() == 1]
-    generate = page.get_by_role('button', name='Generate', exact=True).filter(visible=True)
+    modes, generate = geometry_controls(page)
     generate_count = generate.count()
     return {
         'url': flow.core.site.origin + route,
