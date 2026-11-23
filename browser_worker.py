@@ -16,47 +16,88 @@ import threading
 from urllib.parse import urlsplit
 
 from hunyuan_workbench import Workbench, FACE_LABELS, digest, dump
+from site_adapters import GlobalAuthError, browser_options, get_site
 
 HOME = "https://3d.hunyuan.tencent.com/"
+HEARTBEAT_TIMEOUT = 15
+BLANK_TABS = {'about:blank', 'chrome://newtab/'}
+
+
+def global_sign_in_instructions(site):
+    return (f'Open {site.origin}/ yourself in the dedicated Chrome tab, sign in there, '
+            'then open Geometry Generation and run web-inspect.')
+
+
+def read_worker_status(root):
+    try:
+        return json.loads((Path(root) / "browser-status.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+def worker_is_responsive(status):
+    return (status.get("state") != "STOPPED"
+            and time.time() - status.get("heartbeat", 0) < HEARTBEAT_TIMEOUT)
 
 def atomic_json(path, data):
     temp = path.with_suffix('.'+uuid.uuid4().hex+'.tmp')
     temp.write_text(dump(data), encoding="utf-8")
     temp.replace(path)
 
-def start(root):
+def start(root, site=None):
+    adapter = get_site(site)
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     status = root / "browser-status.json"
-    if status.exists():
-        saved = json.loads(status.read_text(encoding="utf-8"))
-        if time.time() - saved.get("heartbeat", 0) < 15 and saved.get("state") != "STOPPED":
-            return saved
+    saved = read_worker_status(root)
+    if worker_is_responsive(saved):
+        if saved.get("site", "china") != adapter.name:
+            raise ValueError("A worker for another site uses this root. Use a separate --root.")
+        return saved
     with (root / "browser-worker.log").open("a", encoding="utf-8") as log:
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), str(root)],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                         env={**os.environ,'DEBUG':'pw:browser'},
+                         env={**os.environ, 'HUNYUAN_WORKBENCH_SITE': adapter.name},
                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-    return {"state": "STARTING", "status_file": str(status), "note": "Dedicated Chrome window; sign in to the same Hunyuan account once."}
+    note = (global_sign_in_instructions(adapter) if adapter.name == 'global'
+            else 'Dedicated Chrome window; sign in to the same Hunyuan account once.')
+    return {"state": "STARTING", "status_file": str(status), "note": note}
 
-def enqueue(root, op, job_id=None, submit=False, text=None):
+def enqueue(root, op, job_id=None, submit=False, text=None, site=None):
+    adapter = get_site(site)
     if op not in {"inspect", "run", "stop", "click_text", "hover_text", "research", "probe", "download", "studio"}:
         raise ValueError("Unsupported worker operation")
+    job = Workbench(root, site=adapter.name).get(job_id) if job_id else None
+    if job is not None:
+        adapter.assert_job(job)
     if op == "run":
-        job = Workbench(root).get(job_id)
+        if job is None:
+            raise ValueError("A job id is required")
         if job["state"] not in {"PREPARED", "UPLOADING", "READY"}:
             raise ValueError("Job is already submitted or uncertain; inspect it instead")
     root = Path(root)
-    status_file=root/'browser-status.json'
-    saved=json.loads(status_file.read_text(encoding='utf-8')) if status_file.exists() else {}
-    if saved.get('state')=='STOPPED' or time.time()-saved.get('heartbeat',0)>15:
-        raise ValueError('Browser worker is not running. Run web-start before enqueueing browser work.')
+    saved = read_worker_status(root)
+    if not worker_is_responsive(saved):
+        raise ValueError("Browser worker is not running. Run web-start before enqueueing browser work.")
+    if saved.get("site", "china") != adapter.name:
+        raise ValueError("Worker belongs to another site. Select its site or use a separate --root.")
+    if adapter.name == "global" and not saved.get("instance_id"):
+        raise ValueError("Restart the Global browser worker to use this version.")
     queue = root / "queue"
     queue.mkdir(parents=True, exist_ok=True)
     request_id = uuid.uuid4().hex
     atomic_json(queue / (request_id + ".json"), {"id": request_id, "op": op, "job_id": job_id,
-                                                 "submit": bool(submit), "text": text, "created": time.time()})
+                                                 "submit": bool(submit), "text": text, "site": adapter.name,
+                                                 "worker_instance_id": saved.get("instance_id"), "created": time.time()})
     return {"request_id": request_id, "state": "QUEUED", "result_file": str(queue / (request_id + ".result.json"))}
+
+def request_matches_worker(request, status):
+    site = request.get("site", "china")
+    instance = status.get("instance_id")
+    return site == status.get("site", "china") and (
+        site != "global" or bool(instance and request.get("worker_instance_id") == instance)
+    )
+
 
 def poll(root, request_id):
     if not re.fullmatch(r"[a-f0-9]{32}", request_id):
@@ -64,34 +105,119 @@ def poll(root, request_id):
     root = Path(root)
     queue = root / "queue"
     result = queue / (request_id + ".result.json")
-    if result.exists():
-        return json.loads(result.read_text(encoding="utf-8"))
-    if (queue / (request_id + ".running")).exists():
-        status = root / "browser-status.json"
-        worker = json.loads(status.read_text(encoding="utf-8")) if status.exists() else {}
-        return {"request_id": request_id, "state": "RUNNING" if time.time()-worker.get("heartbeat",0)<60 else "WORKER_UNRESPONSIVE", "worker": worker}
-    if (queue / (request_id + ".json")).exists():
-        return {"request_id": request_id, "state": "QUEUED"}
+    # The queue only moves forward, through these successive filenames.
+    for suffix, state in ((".result.json", None), (".json", "QUEUED"), (".running", "RUNNING")):
+        try:
+            record = json.loads((queue / (request_id + suffix)).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        if state is None:
+            return record
+        worker = read_worker_status(root)
+        if result.is_file():
+            return json.loads(result.read_text(encoding="utf-8"))
+        if not worker_is_responsive(worker):
+            return {"request_id": request_id, "state": "WORKER_UNRESPONSIVE", "worker": worker}
+        if not request_matches_worker(record, worker):
+            return {"request_id": request_id, "state": "ERROR",
+                    "error": "Browser worker or site changed. Inspect the job before making a new request."}
+        response = {"request_id": request_id, "state": state}
+        if state == "RUNNING":
+            response["worker"] = worker
+        return response
     raise ValueError("Unknown request id")
 
+class GlobalAuthPause:
+    """Keep the blocked tab open and resume only after an explicit inspection."""
+
+    def __init__(self, status):
+        self.status = status
+        self.error = self.flow = None
+
+    def block(self, flow, error):
+        self.error, self.flow = error, flow
+        self.status(error.code, str(error))
+
+    def check(self, home, *, inspecting=False):
+        if self.error:
+            if not inspecting:
+                raise self.error
+            blocked = self.flow if not self.flow.page.is_closed() else home
+            if blocked.page.url in BLANK_TABS:
+                raise self.error
+            blocked.guard()
+            if urlsplit(blocked.page.url).path.rstrip('/') != urlsplit(home.core.site.home).path:
+                raise self.error
+            if blocked is not home:
+                home.guard()
+            from global_adapter import geometry_controls
+            modes, generate = geometry_controls(blocked.page)
+            if not modes or generate.count() != 1:
+                error = GlobalAuthError('HUMAN_ACTION_REQUIRED',
+                                        'Wait for Geometry Generation to show its image form, then run web-inspect.')
+                self.block(blocked, error)
+                raise error
+            self.error = self.flow = None
+            self.status('IDLE')
+        else:
+            home.guard()
+
+
 class BrowserFlow:
-    def __init__(self, page, core, status_callback=lambda *args: None):
+    def __init__(self, page, core, status_callback=lambda *args: None, auth_pause=None):
         self.page, self.core, self.status = page, core, status_callback
+        self.auth_pause = auth_pause
+        self.document_status = None
+        if page is not None and core.site.name == 'global':
+            page.on('response', self.record_navigation_status)
+
+    def record_navigation_status(self, response):
+        if response.request.is_navigation_request() and response.frame == self.page.main_frame:
+            self.document_status = response.status
 
     def guard(self):
-        u = urlsplit(self.page.url)
-        if u.scheme != "https" or u.hostname != "3d.hunyuan.tencent.com":
-            raise ValueError("HUMAN_ACTION_REQUIRED: browser is outside the official Hunyuan workbench")
-        # Never interact with verification frames, login controls, or agreements.
-        for frame in self.page.frames:
-            if re.search(r"captcha|t\.captcha", frame.url, re.I):
-                text = frame.locator("body").inner_text(timeout=2000)
-                if text.strip() and "验证成功" not in text:
-                    raise ValueError("HUMAN_ACTION_REQUIRED: complete the visible verification in Chrome")
+        if self.core.site.name != 'global':
+            self.core.site.guard(self.page)
+            return
+        try:
+            self.core.site.guard(self.page, self.document_status)
+        except GlobalAuthError as error:
+            if self.auth_pause is not None:
+                self.auth_pause.block(self, error)
+            raise
+
+    def navigate(self, url, *, timeout):
+        is_global = self.core.site.name == 'global'
+        try:
+            self.page.goto(url, wait_until='domcontentloaded', timeout=timeout)
+        except Exception:
+            if is_global and not self.page.is_closed() and self.page.url != 'about:blank':
+                self.guard()
+            raise
+        if is_global:
+            self.guard()
+
+    def open_start_page(self):
+        site = self.core.site
+        if site.name != 'global':
+            self.navigate(site.home, timeout=45000)
+            self.status('READY', 'Dedicated Chrome is open; complete first sign-in there')
+            return
+        # Global sign-in starts with a user navigation, even in a restored profile.
+        # Detect an existing restriction without refreshing the challenge.
+        if self.page.url not in BLANK_TABS:
+            try:
+                self.guard()
+            except GlobalAuthError:
+                return
+        self.auth_pause.block(self, GlobalAuthError('HUMAN_ACTION_REQUIRED', global_sign_in_instructions(site)))
 
     def inspect(self):
         self.guard()
         safe_url = urlsplit(self.page.url)
+        if self.core.site.name == 'global':
+            from global_adapter import inspect_geometry
+            return inspect_geometry(self)
         self.page.screenshot(path=str(self.core.root / "browser-current.png"))
         return {"url": safe_url.scheme + "://" + safe_url.netloc + safe_url.path, "title": self.page.title(),
                 "body": self.page.locator("body").inner_text(timeout=5000)[:18000],
@@ -174,6 +300,41 @@ class BrowserFlow:
             self.core.transition(job_id, "UNCERTAIN", "Submission result ambiguous; inspect task list before any further action", expected="SUBMITTING")
             raise
 
+def resolve_job_flow(home, job_flows, job_id, *, preparing=False, inspecting=False):
+    site = home.core.site
+    if home.auth_pause is not None:
+        home.auth_pause.check(home)
+    target = job_flows.get(job_id)
+    if target is not None and target.page.is_closed():
+        target = None
+    if inspecting and site.name == 'global':
+        if target is None or target.page.url in BLANK_TABS:
+            raise ValueError('No open Studio tab for this job. Use web-inspect without a job id, or prepare the job first.')
+        return target
+    if target is not None and (site.name != 'global' or preparing or target.page.url not in BLANK_TABS):
+        return target
+
+    from lifecycle import read_binding
+    job = home.core.get(job_id)
+    site.assert_job(job)
+    if not preparing:
+        route = site.validate_url(read_binding(home, job_id).get('route') or site.route(job.get('feature', 'geometry')))
+    if target is None:
+        target = BrowserFlow(home.page.context.new_page(), home.core, home.status, home.auth_pause)
+        job_flows[job_id] = target
+    if preparing:
+        # Preparation owns its one navigation and resets the form before filling it.
+        return target
+    try:
+        target.navigate(route, timeout=30000)
+    except GlobalAuthError:
+        raise  # Keep this tab open for manual verification.
+    except Exception:
+        target.page.close()
+        raise
+    return target
+
+
 def worker(root):
     from playwright.sync_api import sync_playwright
     root = Path(root).resolve()
@@ -190,53 +351,58 @@ def worker(root):
             msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
             return
+    else:
+        import fcntl
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+    core = Workbench(root)
+    site = core.site
+    identity = {"pid": os.getpid(), "site": site.name, "instance_id": uuid.uuid4().hex}
     status_data={'state':'STARTING','detail':''}
     status_lock=threading.Lock()
     stop_heartbeat=threading.Event()
     def status(state=None, detail=""):
         with status_lock:
             if state is not None: status_data.update(state=state,detail=detail)
-            atomic_json(root / "browser-status.json", {**status_data, "heartbeat": time.time(), "pid": os.getpid()})
+            atomic_json(root / "browser-status.json", {**status_data, **identity, "heartbeat": time.time()})
     def pulse():
         while not stop_heartbeat.wait(2): status()
     threading.Thread(target=pulse,daemon=True).start()
     status("STARTING")
     queue = root / "queue"
     queue.mkdir(exist_ok=True)
-    # A crashed action is never replayed: it may already have consumed quota.
-    for claim in queue.glob('*.running'):
-        result=claim.with_suffix('.result.json')
-        if result.exists(): continue
-        req=json.loads(claim.read_text(encoding='utf-8'))
-        atomic_json(result,{'state':'ERROR','request_id':req['id'],'error':'Worker interrupted. Action not replayed; inspect task identity before continuing.'})
-        if req.get('job_id'):
-            core=Workbench(root)
-            if core.get(req['job_id'])['state']=='SUBMITTING': core.transition(req['job_id'],'UNCERTAIN','Worker interrupted after submission reservation',expected='SUBMITTING')
     try:
+        # Record ambiguous reservations before writing the terminal queue result.
+        for claim in queue.glob('*.running'):
+            result = claim.with_suffix('.result.json')
+            if result.exists():
+                continue
+            req = json.loads(claim.read_text(encoding='utf-8'))
+            job_id = req.get('job_id')
+            if job_id and core.get(job_id)['state'] == 'SUBMITTING':
+                core.transition(job_id, 'UNCERTAIN', 'Worker interrupted after submission reservation',
+                                expected='SUBMITTING')
+            atomic_json(result, {'state': 'ERROR', 'request_id': req['id'],
+                                 'error': 'Worker interrupted. Action not replayed; inspect the job before continuing.'})
         with sync_playwright() as pw:
-            context = pw.chromium.launch_persistent_context(str(root / "chrome-profile"), channel="chrome", headless=False,
-                viewport={"width": 1440, "height": 1000}, accept_downloads=True, chromium_sandbox=True)
+            profile = root / ("chrome-profile" if site.name == "china" else "global/chrome-profile")
+            context = pw.chromium.launch_persistent_context(str(profile), headless=False,
+                viewport={"width": 1440, "height": 1000}, accept_downloads=True, **browser_options())
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto(HOME, wait_until="domcontentloaded", timeout=45000)
-            flow = BrowserFlow(page, Workbench(root), status)
+            auth_pause = GlobalAuthPause(status) if site.name == 'global' else None
+            flow = BrowserFlow(page, core, status, auth_pause)
+            flow.open_start_page()
             job_flows={}
-            def job_flow(job_id):
-                if job_id in job_flows and not job_flows[job_id].page.is_closed(): return job_flows[job_id]
-                from studio_adapter import ROUTES
-                from lifecycle import read_binding
-                job=flow.core.get(job_id)
-                target=BrowserFlow(context.new_page(),flow.core,status)
-                route=read_binding(target,job_id).get('route') or HOME.rstrip('/')+ROUTES[job.get('feature','geometry')][1]
-                target.page.goto(route,wait_until='domcontentloaded',timeout=30000)
-                target.page.locator('#assets-container').wait_for(state='attached',timeout=15000)
-                job_flows[job_id]=target
-                return target
-            status("READY", "Dedicated Chrome is open; complete first sign-in there")
+            def job_flow(job_id, **options):
+                return resolve_job_flow(flow, job_flows, job_id, **options)
             running = True
             heartbeat = 0
             while running and not page.is_closed():
                 if time.monotonic() - heartbeat > 2:
-                    status("IDLE")
+                    if auth_pause is None or auth_pause.error is None:
+                        status("IDLE")
                     heartbeat = time.monotonic()
                 for source in sorted(queue.glob("*.json"), key=lambda p: p.stat().st_mtime_ns):
                     if source.name.endswith(".result.json"):
@@ -247,10 +413,20 @@ def worker(root):
                     except FileNotFoundError:
                         continue
                     req = json.loads(claim.read_text(encoding="utf-8"))
+                    target = None
                     try:
+                        if not request_matches_worker(req, identity):
+                            raise ValueError("Browser worker or site changed. Inspect the job before making a new request.")
+                        if auth_pause is not None and req["op"] != "stop":
+                            auth_pause.check(flow, inspecting=req["op"] == "inspect")
                         status("BUSY", req["op"])
-                        target=job_flow(req['job_id']) if req.get('job_id') else flow
+                        studio_request = json.loads(req.get("text") or "{}") if req["op"] == "studio" else {}
+                        preparing = site.name == 'global' and (req["op"] == "run" or studio_request.get("action") == "run")
+                        target = (job_flow(req['job_id'], preparing=preparing, inspecting=req["op"] == "inspect")
+                                  if req.get('job_id') else flow)
                         if req["op"] == "inspect": result = target.inspect()
+                        elif site.name == "global" and req["op"] not in {"studio", "run", "stop"}:
+                            raise ValueError("This research operation is limited to China")
                         elif req["op"] in {"click_text", "hover_text"}:
                             flow.guard()
                             loc = page.get_by_text(req["text"], exact=True)
@@ -271,19 +447,32 @@ def worker(root):
                             result = importlib.reload(studio_adapter).download_current(flow, req.get("text") or "glb", req.get("job_id"))
                         elif req["op"] == "studio":
                             import importlib, studio_adapter
-                            result = importlib.reload(studio_adapter).dispatch(target, json.loads(req.get("text") or "{}"), req.get("job_id"))
+                            result = importlib.reload(studio_adapter).dispatch(target, studio_request, req.get("job_id"))
                         elif req["op"] == "stop": result, running = {"state": "STOPPED"}, False
                         else: raise ValueError("Unknown operation")
                         response = {"state": "COMPLETE", "request_id": req["id"], "result": result}
                     except Exception as error:
+                        if (auth_pause is not None and target is not None and target.page.url not in BLANK_TABS
+                                and not isinstance(error, GlobalAuthError)):
+                            try:
+                                target.guard()
+                            except GlobalAuthError as auth_error:
+                                error = auth_error
+                            except Exception:
+                                pass  # Keep the original error if the page is unavailable.
                         response = {"state": "ERROR", "request_id": req["id"], "error": str(error)[:4000]}
+                        if isinstance(error, GlobalAuthError):
+                            response["code"] = error.code
                         try:
-                            target.page.screenshot(path=str(queue / (req["id"] + "-error.png")))
-                            response["screenshot"] = str(queue / (req["id"] + "-error.png"))
+                            if site.name == 'china' and target is not None:
+                                target.page.screenshot(path=str(queue / (req["id"] + "-error.png")))
+                                response["screenshot"] = str(queue / (req["id"] + "-error.png"))
                         except Exception:
                             pass
                     atomic_json(queue / (req["id"] + ".result.json"), response)
-                if running:
+                    if not running:
+                        break
+                if running and (auth_pause is None or auth_pause.error is None):
                     import lifecycle
                     lifecycle.watch_tick(flow,job_flow)
                 if not page.is_closed(): page.wait_for_timeout(200)
@@ -293,7 +482,7 @@ def worker(root):
         raise
     finally:
         stop_heartbeat.set()
-        status("STOPPED")
+        if status_data["state"] != "STOPPED": status("STOPPED")
         lock.close()
 
 if __name__ == "__main__":

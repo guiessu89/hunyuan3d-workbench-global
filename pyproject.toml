@@ -33,5 +33,5 @@ hunyuan-workbench = "hunyuan_workbench:main"
 hunyuan-workbench-mcp = "hunyuan_workbench:serve"
 
 [tool.setuptools]
-py-modules = ["hunyuan_workbench", "browser_worker", "studio_adapter", "lifecycle", "features", "feature_adapter", "command_api"]
+py-modules = ["hunyuan_workbench", "browser_worker", "studio_adapter", "lifecycle", "features", "feature_adapter", "command_api", "site_adapters", "global_adapter", "mcp_config"]
 include-package-data = false

@@ -7,9 +7,12 @@ import sys
 import time
 from hunyuan_workbench import Workbench, VERSION, VIEWS, dump, inspect_asset
 from features import capabilities, prepare_feature
-from browser_worker import start, enqueue, poll
+from browser_worker import start, enqueue, poll, read_worker_status, worker_is_responsive
 
 def request(core,action,job_id=None,wait=0,**options):
+    if job_id: core.site.assert_job(core.get(job_id))
+    if core.site.name == 'global' and action == 'run' and options.get('submit'):
+        raise ValueError('Global requires web-run, then a separate explicit submit')
     if action=='download_job' and job_id:
         job=core.get(job_id)
         if job['state']=='DOWNLOADED':
@@ -21,11 +24,12 @@ def request(core,action,job_id=None,wait=0,**options):
                 from lifecycle import download_job
                 from browser_worker import BrowserFlow
                 return download_job(BrowserFlow(None,core),job_id,fmt)
-    result=enqueue(core.root,'studio',job_id,text=json.dumps({'action':action,**options}))
+    result=enqueue(core.root,'studio',job_id,site=core.site.name,text=json.dumps({'action':action,**options}))
     deadline=time.monotonic()+max(0,min(wait,60))
     while time.monotonic()<deadline:
         current=poll(core.root,result['request_id'])
         if current['state'] not in {'QUEUED','RUNNING'}: return current
+        result.update(current)
         time.sleep(.2)
     return result
 
@@ -33,22 +37,22 @@ def watches(core):
     return [json.loads(p.read_text(encoding='utf-8')) for p in (core.root/'watches').glob('hy_*.json')]
 
 def doctor(core):
-    p=core.root/'browser-status.json'
-    worker=json.loads(p.read_text(encoding='utf-8')) if p.exists() else {'state':'NOT_STARTED'}
-    return {'version':VERSION,'python':sys.executable,'state_root':str(core.root),'worker':worker,
-            'responsive':time.time()-worker.get('heartbeat',0)<15 and worker.get('state')!='STOPPED',
+    worker = read_worker_status(core.root) or {'state': 'NOT_STARTED'}
+    return {'site':core.site.name,'version':VERSION,'python':sys.executable,'state_root':str(core.root),'worker':worker,
+            'responsive':worker_is_responsive(worker)
+                         and worker.get('site','china')==core.site.name,
             'transport':'local file queue; persistent Chrome; stdio MCP','cloud_api':False,
             'job_count':len(core.list()),'watches':watches(core)}
 
 def serve():
     from mcp.server.fastmcp import FastMCP
-    mcp=FastMCP('hunyuan-workbench',instructions='Control the official Hunyuan web workbench through a persistent local Chrome worker. Existing web account/quota; no Cloud API. Prepare local specs, run once, monitor locally and archive matching downloads. submit=True consumes web quota; only run jobs authorized by the user. Never resubmit SUBMITTING/UNCERTAIN/RUNNING jobs. Check capabilities for tested vs assisted functions.')
+    mcp=FastMCP('hunyuan-workbench',instructions='Use the official Hunyuan website through a persistent Chrome worker. Global requires local registration, browser form preparation, and a separate workbench_submit. Submit can spend web quota; obtain user authorization for this job first. Never resubmit SUBMITTING/UNCERTAIN/RUNNING jobs. Check capabilities for verified workflows.')
     core=Workbench()
 
     @mcp.tool()
     def workbench_capabilities() -> dict:
         """Observed feature catalog, inputs, tested status and current limitations. Excludes world generation."""
-        return capabilities()
+        return capabilities(core.site.name)
 
     @mcp.tool()
     def workbench_prepare(name:str,views:dict[str,str],face_count:int=50000,height_m:float|None=None,revision:str='v001')->dict:
@@ -73,11 +77,11 @@ def serve():
     @mcp.tool()
     def workbench_browser_start()->dict:
         """Start/reconnect the persistent local browser. Uses its existing official web login."""
-        return start(core.root)
+        return start(core.root, core.site.name)
 
     @mcp.tool()
     def workbench_browser_run(job_id:str,submit:bool=False)->dict:
-        """Upload and configure the full job in one local execution. submit=True generates once and starts local monitoring with automatic download; consumes web quota."""
+        """Upload and prepare a form without spending quota. China only: submit=True can spend quota. Global requires a separate workbench_submit."""
         return request(core,'run',job_id,submit=submit)
 
     @mcp.tool()
@@ -106,8 +110,8 @@ def serve():
         return request(core,'download_job',job_id,format=format_name)
 
     @mcp.tool()
-    def workbench_assets(job_id:str)->dict:
-        """List currently loaded visible asset cards and thumbnail identities on this job page. Does not enumerate unloaded pages."""
+    def workbench_assets(job_id:str|None=None)->dict:
+        """List visible Studio asset cards and thumbnail identities on the selected job or default page."""
         return request(core,'cards',job_id)
 
     @mcp.tool()
@@ -118,7 +122,7 @@ def serve():
     @mcp.tool()
     def workbench_browser_inspect(job_id:str|None=None)->dict:
         """Read the visible job page or default page for diagnosing a changed UI."""
-        return enqueue(core.root,'inspect',job_id)
+        return enqueue(core.root,'inspect',job_id,site=core.site.name)
 
     @mcp.tool()
     def workbench_browser_result(request_id:str)->dict:
@@ -129,6 +133,11 @@ def serve():
     def workbench_ingest(job_id:str,downloaded_file:str)->dict:
         """Validate/archive a manually downloaded artifact for a confirmed successful job."""
         return core.ingest(job_id,downloaded_file)
+
+    @mcp.tool()
+    def workbench_inspect_asset(file:str)->dict:
+        """Validate a local downloaded model and report its file integrity and available mesh metadata."""
+        return inspect_asset(Path(file))
 
     @mcp.tool()
     def workbench_blender_script(job_id:str)->dict:
@@ -147,6 +156,7 @@ def main():
         sys.stdout.reconfigure(encoding='utf-8');sys.stderr.reconfigure(encoding='utf-8')
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--root',type=Path)
+    p.add_argument('--site', choices=('global','china'))
     sub=p.add_subparsers(dest='command',required=True)
     for name in ('capabilities','list','doctor','mcp','web-start','web-stop','watches'):
         sub.add_parser(name)
@@ -171,14 +181,17 @@ def main():
     check=sub.add_parser('inspect-asset',aliases=['inspect-glb']);check.add_argument('file',type=Path)
     args=p.parse_args()
     try:
+        if args.site: os.environ['HUNYUAN_WORKBENCH_SITE']=args.site
         if args.root: os.environ['HUNYUAN_WORKBENCH_ROOT']=str(args.root.resolve())
         core=Workbench(args.root)
         cmd=args.command
         if cmd=='mcp': serve();return
-        if cmd=='capabilities': result=capabilities()
+        if cmd=='capabilities': result=capabilities(core.site.name)
         elif cmd=='prepare': result=core.prepare(args.name,{v:getattr(args,v) for v in VIEWS if getattr(args,v)},args.faces,args.height,args.revision)
         elif cmd=='prepare-spec': result=prepare_feature(core,json.loads(args.file.read_text(encoding='utf-8-sig')))
         elif cmd=='batch':
+            if args.submit and core.site.name == 'global':
+                raise ValueError('Global requires individual, separately prepared submissions')
             specs=json.loads(args.file.read_text(encoding='utf-8-sig'))
             if not isinstance(specs,list) or not 1<=len(specs)<=8: raise ValueError('Batch must contain 1..8 specifications')
             from features import validate
@@ -190,9 +203,9 @@ def main():
         elif cmd=='list': result=core.list()
         elif cmd=='get': result=core.get(args.job_id)
         elif cmd=='doctor': result=doctor(core)
-        elif cmd=='web-start': result=start(core.root)
-        elif cmd=='web-stop': result=enqueue(core.root,'stop')
-        elif cmd=='web-inspect': result=enqueue(core.root,'inspect',args.job_id)
+        elif cmd=='web-start': result=start(core.root, core.site.name)
+        elif cmd=='web-stop': result=enqueue(core.root,'stop',site=core.site.name)
+        elif cmd=='web-inspect': result=enqueue(core.root,'inspect',args.job_id,site=core.site.name)
         elif cmd=='web-poll': result=poll(core.root,args.request_id)
         elif cmd=='web-run': result=request(core,'run',args.job_id,args.wait,submit=args.submit)
         elif cmd=='submit': result=request(core,'submit_and_watch',args.job_id,args.wait)

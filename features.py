@@ -18,10 +18,21 @@ CATALOG = {
  'animation': {'label':'动画生成','modes':['template'],'inputs':'visible character thumbnail + exact motion template','status':'form_adapter','notes':['从角色选择器选取已绑骨角色或内置角色；此处没有本地模型上传入口','当前工作台实测是动作模板；不宣称支持API中的文生动作功能']},
 }
 
-def capabilities():
+def capabilities(site=None):
+    from site_adapters import get_site
+    adapter = get_site(site)
+    if adapter.name == "global":
+        return {"provider": "official-web-workbench", "site": "global", "url": adapter.home,
+                "cloud_api": False, "world_generation": False, "quota": "Read from visible UI; never assume 99",
+                "features": {k: {"modes": ["single", "multiview"] if k == "geometry" else [],
+                                 "status": "experimental_adapter" if k == "geometry" else "blocked",
+                                 "ui_preparation": "not_live_tested", "generation_e2e": False, "download_tested": False,
+                                 "notes": ["Global live verification pending; China evidence does not apply."]}
+                             for k, v in CATALOG.items()},
+                "downloads": [], "download_note": "Discover available formats on the selected asset."}
     features={k:{**v,'ui_preparation':'live_verified','generation_e2e':k in {'geometry','texture'}} for k,v in CATALOG.items()}
     features['texture']['notes']=features['texture']['notes']+['已验证多视图纹理生成并自动下载GLB；其他模式仍需对应产物验收']
-    return {'provider':'official-web-workbench','observed_date':'2026-09-08','world_generation':False,
+    return {'provider':'official-web-workbench','site':'china','observed_date':'2026-09-08','world_generation':False,
             'features':features,'downloads':['auto','glb','fbx','stl','usdz','mp4','gif'],
             'download_note':'Formats are discovered per selected asset; not every asset supports every format.',
             'monitor':'Exact new asset DOM element during generation; unique thumbnail after completion. Pending jobs interrupted before a stable identity require review.'}
@@ -87,10 +98,14 @@ def validate(spec):
     return result
 
 def prepare_feature(core,spec):
+    if core.site.name == 'global' and isinstance(spec, dict) and spec.get('feature') != 'geometry':
+        raise ValueError('UNVERIFIED_WORKFLOW: Global supports experimental image geometry only')
     cfg=validate(spec)
+    cfg['site']=core.site.name
     if cfg['feature']=='geometry' and cfg['mode']=='multiview':
         return core.prepare(cfg['name'],{k:v['path'] for k,v in cfg['views'].items()},cfg['face_count'],cfg['height_m'],cfg['revision'])
     identity={k:v for k,v in cfg.items() if k not in {'views','model_file'}}
+    if core.site.name == 'china': identity.pop('site')
     identity['views']={k:v['sha256'] for k,v in cfg['views'].items()}
     if 'model_file' in cfg: identity['model_sha256']=cfg['model_file']['sha256']
     fingerprint=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
@@ -106,7 +121,7 @@ def prepare_feature(core,spec):
             shutil.copy2(src,dst)
             if digest(dst)!=info['sha256']: raise ValueError('Input changed during preparation')
             info.update(source_path=str(src),path=str(dst))
-        cfg.update(folder=str(folder),provider='official-web-workbench',workbench_url='https://3d.hunyuan.tencent.com/')
+        cfg.update(folder=str(folder),provider='official-web-workbench',workbench_url=core.site.home)
         (folder/'manifest.json').write_text(dump(cfg),encoding='utf-8')
         con.execute('INSERT INTO jobs VALUES (?,?,?,?,?)',(job_id,fingerprint,'PREPARED',dump(cfg),time.time()))
     return core.get(job_id)

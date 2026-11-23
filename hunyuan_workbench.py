@@ -176,8 +176,13 @@ def inspect_asset(path: Path) -> dict:
             'validation_scope':'File signature/archive integrity; mesh and animation need Blender validation'}
 
 class Workbench:
-    def __init__(self, root: str | Path | None = None):
-        selected = root if root is not None else os.getenv("HUNYUAN_WORKBENCH_ROOT") or default_state_root()
+    def __init__(self, root: str | Path | None = None, site: str | None = None):
+        from site_adapters import get_site
+        self.site = get_site(site)
+        default = default_state_root()
+        if self.site.name == "global":
+            default = default.with_name("hunyuan-workbench-global")
+        selected = root if root is not None else os.getenv("HUNYUAN_WORKBENCH_ROOT") or default
         self.root = Path(selected).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db = self.root / "jobs.sqlite3"
@@ -222,9 +227,10 @@ class Workbench:
         inspected = {view: inspect_image(Path(views[view])) for view in VIEWS if view in views}
         if len({v["sha256"] for v in inspected.values()}) != len(inspected):
             raise ValueError("Do not use duplicate image files as different views")
-        spec = {"name": name, "revision": revision, "model": "3.1", "face_count": face_count,
+        spec = {"name": name, "revision": revision, "site": self.site.name, "model": "3.1" if self.site.name == "china" else None, "face_count": face_count,
                 "height_m": height_m, "views": {k: v["sha256"] for k, v in inspected.items()}}
-        fingerprint = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
+        identity = {k: v for k, v in spec.items() if k != "site" or self.site.name != "china"}
+        fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             existing = con.execute("SELECT id FROM jobs WHERE fingerprint=?", (fingerprint,)).fetchone()
@@ -241,7 +247,7 @@ class Workbench:
                     raise ValueError("Reference changed during preparation")
                 info["source_path"], info["path"] = info["path"], str(dest)
             data = {**spec, "feature":"geometry", "mode":"multiview", "views": inspected, "folder": str(folder), "provider": "official-web-workbench",
-                    "workbench_url": "https://3d.hunyuan.tencent.com/", "submitted": False}
+                    "workbench_url": self.site.home, "submitted": False}
             (folder / "manifest.json").write_text(dump(data), encoding="utf-8")
             con.execute("INSERT INTO jobs VALUES (?,?,?,?,?)", (job_id, fingerprint, "PREPARED", dump(data), time.time()))
         return self.get(job_id)

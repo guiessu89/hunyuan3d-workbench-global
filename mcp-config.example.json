@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "hunyuan-workbench": {
-      "command": "hunyuan-workbench-mcp",
-      "args": []
+    "hunyuan3d-global": {
+      "command": "/absolute/path/to/venv/bin/python",
+      "args": ["-I", "-m", "hunyuan_workbench", "--site", "global", "mcp"]
     }
   }
 }

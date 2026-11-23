@@ -9,6 +9,7 @@ import json
 import re
 import time
 from hunyuan_workbench import dump
+from site_adapters import GlobalAuthError
 
 CARD = '#assets-container > div'
 
@@ -38,9 +39,16 @@ def retain_new_card(flow, job_id, before_handles, timeout=25000):
     """Observe one added asset card, preserving the same element while it changes."""
     deadline = time.monotonic()+timeout/1000
     while time.monotonic()<deadline:
+        flow.guard()
         candidates = flow.page.locator(CARD).element_handles()
+        if flow.core.site.name == 'global' and any(not old.evaluate('e => e.isConnected') for old in before_handles):
+            raise ValueError('The asset panel replaced existing cards; submission identity is uncertain')
         added = [e for e in candidates if not any(e.evaluate('(e,old)=>e===old', old) for old in before_handles)]
         if len(added)==1:
+            if flow.core.site.name == 'global' and not added[0].evaluate(
+                "e => /generating|queued|processing|pending/i.test(e.innerText) || !!e.querySelector('[role=progressbar]')"
+            ):
+                raise ValueError('New Global card has no confirmed generation indicator')
             if not hasattr(flow, 'task_handles'): flow.task_handles = {}
             flow.task_handles[job_id] = added[0]
             binding = {"kind":"live-dom-element", "route":flow.page.url.split('?')[0], "bound_at":time.time(),
@@ -95,14 +103,14 @@ def tick(flow, job_id, auto_download=False, format_name='auto'):
     handle,binding = resolve_card(flow,job_id)
     info = handle.evaluate("e=>({text:e.innerText,thumbnail:e.querySelector('img')?.src?.split('?')[0]||null,selected:!!e.querySelector('[class*=bg-gradient-to-r]')})")
     if not completed_thumbnail(info['thumbnail']): info['thumbnail']=None
-    if re.search('生成失败|任务失败|处理失败',info['text']):
+    if re.search('生成失败|任务失败|处理失败|generation failed|task failed|processing failed',info['text'],re.I):
         flow.core.transition(job_id,'FAILED','Matching asset card: '+info['text'][:800],expected=job['state'])
-    elif info['thumbnail'] and not re.search('生成中|排队|处理中',info['text']):
+    elif info['thumbnail'] and not re.search('生成中|排队|处理中|generating|queued|processing|pending',info['text'],re.I):
         binding.update(kind='thumbnail',thumbnail=info['thumbnail'],completed_observed_at=time.time())
         save_binding(flow,job_id,binding)
         if not info['selected']:
             handle.click(timeout=5000)
-        flow.page.get_by_role('button',name='下载',exact=True).wait_for(state='visible',timeout=15000)
+        flow.page.get_by_role('button',name='Download' if flow.core.site.name == 'global' else '下载',exact=True).wait_for(state='visible',timeout=15000)
         # Recheck the selection after asynchronous loading.
         if not handle.evaluate("e=>!!e.querySelector('[class*=bg-gradient-to-r]')"):
             raise ValueError('Matching asset is no longer selected; export stopped')
@@ -135,11 +143,12 @@ def download_job(flow,job_id,format_name='auto'):
             raise ValueError('Additional export is missing or changed')
     if job['state'] not in {'SUCCEEDED','DOWNLOADED'}: tick(flow,job_id)
     if flow.core.get(job_id)['state'] not in {'SUCCEEDED','DOWNLOADED'}: raise ValueError('Task is not complete yet')
+    flow.guard()
     handle,binding = resolve_card(flow,job_id)
     if not binding.get('thumbnail'): raise ValueError('Completion identity missing')
     if not handle.evaluate("e=>!!e.querySelector('[class*=bg-gradient-to-r]')"):
         handle.click(timeout=5000)
-        flow.page.get_by_role('button',name='下载',exact=True).wait_for(state='visible',timeout=15000)
+        flow.page.get_by_role('button',name='Download' if flow.core.site.name == 'global' else '下载',exact=True).wait_for(state='visible',timeout=15000)
     if not handle.evaluate("e=>!!e.querySelector('[class*=bg-gradient-to-r]')"):
         raise ValueError('Selected asset mismatch')
     report=download_current(flow,format_name,job_id if job['state']!='DOWNLOADED' else None)
@@ -181,6 +190,9 @@ def watch_tick(flow, resolve_flow=None):
             data.update(last_result=result,last_check=time.time(),errors=0)
             data.pop('last_error',None);data.pop('attention_required',None)
             if result['state'] in {'FAILED','DOWNLOADED'} or (result['state']=='SUCCEEDED' and not data['auto_download']): data['enabled']=False
+        except GlobalAuthError:
+            # The worker has paused the browser queue. Keep the watch and job unchanged.
+            return
         except Exception as error:
             data.update(last_error=str(error)[:1500],last_check=time.time(),errors=data.get('errors',0)+1)
             if 'TASK_IDENTITY_REQUIRED' in str(error) or 'HUMAN_ACTION_REQUIRED' in str(error):

@@ -8,6 +8,15 @@ import unittest
 from unittest.mock import patch
 from PIL import Image
 from hunyuan_workbench import Workbench, default_state_root, digest, inspect_glb
+from site_adapters import browser_options
+
+
+def launch_fixture_browser(playwright):
+    options = browser_options()
+    if os.environ.get('HUNYUAN_OFFLINE_FIXTURE_NO_SANDBOX') == '1':
+        # Only for intercepted offline fixtures in a sandboxed test runner.
+        options['chromium_sandbox'] = False
+    return playwright.chromium.launch(headless=True, **options)
 
 
 class StateLocationTests(unittest.TestCase):
@@ -15,7 +24,7 @@ class StateLocationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)
             with patch('hunyuan_workbench.sys.platform', 'win32'), patch.dict(os.environ, {'LOCALAPPDATA': str(base)}, clear=True):
-                core = Workbench()
+                core = Workbench(site='china')
                 self.assertEqual(core.root, (base / 'hunyuan-workbench').resolve())
                 self.assertTrue(core.db.is_file())
 
@@ -44,7 +53,8 @@ class StateLocationTests(unittest.TestCase):
                 with self.subTest(platform=platform), patch('hunyuan_workbench.sys.platform', platform), patch('hunyuan_workbench.Path.home', return_value=base), patch.dict(os.environ, {'HUNYUAN_WORKBENCH_ROOT': ''}, clear=True):
                     expected = base / suffix / 'hunyuan-workbench'
                     self.assertEqual(default_state_root(), expected)
-                    self.assertEqual(Workbench().root, expected.resolve())
+                    self.assertEqual(Workbench(site='china').root, expected.resolve())
+                    self.assertEqual(Workbench().root, expected.with_name('hunyuan-workbench-global').resolve())
 
     def test_xdg_user_data_override(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -55,7 +65,7 @@ class LedgerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.core = Workbench(self.root / "state")
+        self.core = Workbench(self.root / "state", site="china")
         self.views = {}
         for view, color in zip(("front", "right", "back"), ("red", "blue", "green")):
             p = self.root / (view + ".png")
@@ -160,7 +170,7 @@ class BrowserFixtureTest(unittest.TestCase):
 </body></html>'''.replace("CARDS", "".join(f'<div class="hy-upload-card hy-upload-card--{v}" data-view="{v}"><input type="file"><img></div>' for v in self.views))
         job = self.prepare()
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(channel="chrome", headless=True, chromium_sandbox=True)
+            browser = launch_fixture_browser(pw)
             context = browser.new_context()
             image = Path(self.views["front"]).read_bytes()
             def route(request):
