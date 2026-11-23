@@ -20,6 +20,12 @@ from site_adapters import GlobalAuthError, browser_options, get_site
 
 HOME = "https://3d.hunyuan.tencent.com/"
 HEARTBEAT_TIMEOUT = 15
+BLANK_TABS = {'about:blank', 'chrome://newtab/'}
+
+
+def global_sign_in_instructions(site):
+    return (f'Open {site.origin}/ yourself in the dedicated Chrome tab, sign in there, '
+            'then open Geometry Generation and run web-inspect.')
 
 
 def read_worker_status(root):
@@ -53,7 +59,9 @@ def start(root, site=None):
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                          env={**os.environ, 'HUNYUAN_WORKBENCH_SITE': adapter.name},
                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-    return {"state": "STARTING", "status_file": str(status), "note": "Dedicated Chrome window; sign in to the same Hunyuan account once."}
+    note = (global_sign_in_instructions(adapter) if adapter.name == 'global'
+            else 'Dedicated Chrome window; sign in to the same Hunyuan account once.')
+    return {"state": "STARTING", "status_file": str(status), "note": note}
 
 def enqueue(root, op, job_id=None, submit=False, text=None, site=None):
     adapter = get_site(site)
@@ -135,6 +143,8 @@ class GlobalAuthPause:
             if not inspecting:
                 raise self.error
             blocked = self.flow if not self.flow.page.is_closed() else home
+            if blocked.page.url in BLANK_TABS:
+                raise self.error
             blocked.guard()
             if urlsplit(blocked.page.url).path.rstrip('/') != urlsplit(home.core.site.home).path:
                 raise self.error
@@ -179,6 +189,21 @@ class BrowserFlow:
             raise
         if is_global:
             self.guard()
+
+    def open_start_page(self):
+        site = self.core.site
+        if site.name != 'global':
+            self.navigate(site.home, timeout=45000)
+            self.status('READY', 'Dedicated Chrome is open; complete first sign-in there')
+            return
+        # Global sign-in starts with a user navigation, even in a restored profile.
+        # Detect an existing restriction without refreshing the challenge.
+        if self.page.url not in BLANK_TABS:
+            try:
+                self.guard()
+            except GlobalAuthError:
+                return
+        self.auth_pause.block(self, GlobalAuthError('HUMAN_ACTION_REQUIRED', global_sign_in_instructions(site)))
 
     def inspect(self):
         self.guard()
@@ -326,14 +351,7 @@ def worker(root):
             page = context.pages[0] if context.pages else context.new_page()
             auth_pause = GlobalAuthPause(status) if site.name == 'global' else None
             flow = BrowserFlow(page, core, status, auth_pause)
-            try:
-                if auth_pause is not None and page.url not in ('about:blank', 'chrome://newtab/'):
-                    # A restored login or challenge tab belongs to the user.
-                    flow.guard()
-                flow.navigate(site.home, timeout=45000)
-                status("READY", "Dedicated Chrome is open; complete first sign-in there")
-            except GlobalAuthError:
-                pass  # Keep the browser and its profile open for manual verification.
+            flow.open_start_page()
             job_flows={}
             def job_flow(job_id):
                 if auth_pause is not None:

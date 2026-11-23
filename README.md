@@ -25,7 +25,7 @@ Follow the [local validation procedure](LOCAL_TESTING.md) for manual sign-in and
 
 Use `hunyuan-workbench` from the installed environment or substitute `<absolute-venv-python> -I -m hunyuan_workbench`.
 
-1. Read `capabilities`, run `web-start`, and sign in manually in the dedicated Chrome window. Use `doctor` to check the worker and `web-inspect` to inspect the page. Read queued requests with `web-poll REQUEST_ID`.
+1. Read `capabilities` and run `web-start`. In the dedicated Chrome tab, open [Hunyuan3D Global](https://hy3d.tencent.ai/), sign in manually if needed, and open Geometry Generation. Use `doctor` to check the worker and `web-inspect` to activate and inspect the Studio session. Read queued requests with `web-poll REQUEST_ID`.
 2. Copy [the single-image example](examples/global-single-prop.json), fill in the image's absolute path, and run `prepare-spec FILE`. For multiple views, use `prepare --name "Stone lantern" --front FRONT.png --right RIGHT.png --back BACK.png`.
 3. Use `web-run JOB_ID --wait 60` to upload and prepare the form. Use `web-inspect --job-id JOB_ID` to inspect the form and check that the job is `READY`. Preparation does not submit.
 4. After the account owner authorizes one generation for this job, run `submit JOB_ID --wait 60`. The adapter requires a recognized positive remaining count in Studio. Check `status JOB_ID` and `watches`. If submission is ambiguous, inspect the asset list and recover only with a confirmed matching asset. Never submit again to find out what happened.

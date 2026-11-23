@@ -8,7 +8,9 @@ Global queue requests now bind to one worker launch rather than an operating sys
 
 The Global worker now pauses on visible CAPTCHA and sign-in failures (`HUMAN_ACTION_REQUIRED`) or a temporary restriction (`AUTH_RATE_LIMITED`). It keeps the existing browser, job records and watches, and resumes after manual verification and an explicit inspection of the Studio.
 
-Cloud Linux passed 43 offline tests, including browser fixtures for Global verification, sign-in failure, Tencent's rate-limit message, HTTP 429, and job and watch preservation. The stdio smoke test reported 20 MCP tools. The previous milestone also verified the installed wheel and source distribution. The production worker uses the Chromium sandbox. Only intercepted offline fixtures used the override needed by the managed Linux runner.
+Global startup no longer opens the protected geometry route. It waits for the user to open the official homepage and reach Geometry Generation in the dedicated profile, followed by an explicit inspection. Fixtures verify zero startup navigations and no refresh of a restored rate-limit page. Tencent’s live decision about the Workbench browser is still unverified.
+
+Cloud Linux passed 45 offline tests, including browser fixtures for Global verification, sign-in failure, Tencent's rate-limit message, HTTP 429, and job and watch preservation. The stdio smoke test reported 20 MCP tools. The previous milestone also verified the installed wheel and source distribution. The production worker uses the Chromium sandbox. Only intercepted offline fixtures used the override needed by the managed Linux runner.
 
 Cloud Chrome reached Tencent's sign-in page, but takeover was unavailable in this chat. Development does not depend on cloud sign-in. The signed-in Studio controls, actual quota, authenticated generation and exports still need testing. Native installer and client registration checks on Windows and macOS are pending. No generation jobs were submitted and no credits were spent.
 

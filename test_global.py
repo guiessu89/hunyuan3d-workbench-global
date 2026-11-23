@@ -213,6 +213,45 @@ class GlobalStudioFixture(unittest.TestCase):
         self.assertEqual(len(requests), 1)
         self.assertEqual(self.core.get(job_id)['state'], 'PREPARED')
 
+    def test_global_start_waits_for_manual_navigation_without_contacting_tencent(self):
+        flow, job_id = self.fixture('single')
+        states = []
+        flow.auth_pause = GlobalAuthPause(lambda state, detail='': states.append(state))
+        navigations = []
+        flow.page.on('request', lambda req: navigations.append(req.url) if req.is_navigation_request() else None)
+
+        flow.open_start_page()
+        with self.assertRaisesRegex(ValueError, r'HUMAN_ACTION_REQUIRED: Open https://hy3d.tencent.ai/ yourself'):
+            flow.auth_pause.check(flow, inspecting=True)
+        self.assertEqual(navigations, [])
+        self.assertEqual(states, ['HUMAN_ACTION_REQUIRED'])
+        self.assertEqual(self.core.get(job_id)['state'], 'PREPARED')
+
+        flow.page.goto(flow.core.site.home)  # Simulate the user's navigation.
+        with self.assertRaisesRegex(ValueError, 'HUMAN_ACTION_REQUIRED'):
+            flow.auth_pause.check(flow)
+        flow.auth_pause.check(flow, inspecting=True)
+        self.assertEqual(navigations, [flow.core.site.home])
+        self.assertTrue(flow.inspect()['geometry_controls_detected'])
+        self.assertEqual(states[-1], 'IDLE')
+
+    def test_global_start_preserves_a_restored_rate_limit_page_without_reloading(self):
+        flow, _ = self.fixture('single')
+        flow.auth_pause = GlobalAuthPause(flow.status)
+        requests = []
+
+        def show_rate_limit(route):
+            requests.append(route.request.url)
+            route.fulfill(content_type='text/html', body='<p>Operation too often. Please retry later.</p>')
+
+        flow.page.route('**/login', show_rate_limit)
+        login = flow.core.site.origin + '/login'
+        flow.page.goto(login)
+        flow.open_start_page()
+        self.assertEqual(flow.auth_pause.error.code, 'AUTH_RATE_LIMITED')
+        self.assertEqual(flow.page.url, login)
+        self.assertEqual(requests, [login])
+
     def test_captcha_rate_limit_pauses_until_manual_resolution_and_inspection(self):
         flow, job_id = self.fixture('single')
         states = []
