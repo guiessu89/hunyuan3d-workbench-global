@@ -1,4 +1,43 @@
-# 混元 3D 网页工作台 CLI / MCP
+# Hunyuan3D Workbench Global
+
+This fork uses the official Hunyuan3D Studio website through a dedicated Chrome profile. Global is the default. The China adapter and its original state directory remain available with `--site china` or `HUNYUAN_WORKBENCH_SITE=china`.
+
+**Global geometry is experimental.** Cloud Chrome reached the official sign-in screen. Form preparation, submission, monitoring and download have been exercised against offline fixtures. Signed-in Studio behavior and account quota still need verification. See [development status](DEVELOPMENT_STATUS.md), [architecture](ARCHITECTURE.md) and [compatibility](COMPATIBILITY.md).
+
+## Install or update
+
+Install Python 3.11+, Google Chrome, and the MCP clients you plan to use. From this fork's `feature/hunyuan3d-global` checkout:
+
+| Platform | Command |
+| --- | --- |
+| macOS | `bash scripts/install-macos.sh` |
+| Windows 11 PowerShell | `.\scripts\install-windows.ps1` |
+
+The installers create or refresh `.venv`, install the package, smoke test MCP, back up host configuration and register only `hunyuan3d-global`. Keep the checkout in place after registration. Choose `codex`, `claude`, or `none` as the first argument on macOS or as `-McpHost` on Windows. Restart the clients after installation.
+
+For manual Claude Desktop registration, merge [the example entry](mcp-config.example.json) into your existing `mcpServers` object. Replace the executable path with the absolute virtual-environment Python path. For Codex, run `codex mcp add hunyuan3d-global -- <absolute-venv-python> -I -m hunyuan_workbench --site global mcp`. Quote the executable path if it contains spaces. Verify the entry with `codex mcp get hunyuan3d-global` and confirm the tools appear in your client.
+
+To uninstall a registration, run `<absolute-venv-python> -I -m mcp_config --host both --remove`. Choose a single host with `--host` if desired. Stop the worker before deleting the checkout or virtual environment. Archived jobs and Chrome profiles are stored separately.
+
+## Prepare and download a prop
+
+Use `hunyuan-workbench` from the installed environment or substitute `<absolute-venv-python> -I -m hunyuan_workbench`.
+
+1. Read `capabilities`, run `web-start`, and sign in manually in the dedicated Chrome window. Use `doctor` to check the worker and `web-inspect` to inspect the page. Read queued requests with `web-poll REQUEST_ID`.
+2. Copy [the single-image example](examples/global-single-prop.json), fill in the image's absolute path, and run `prepare-spec FILE`. For multiple views, use `prepare --name "Stone lantern" --front FRONT.png --right RIGHT.png --back BACK.png`.
+3. Use `web-run JOB_ID --wait 60` to upload and prepare the form. Use `web-inspect --job-id JOB_ID` to inspect the form and check that the job is `READY`. Preparation does not submit.
+4. After the account owner authorizes one generation for this job, run `submit JOB_ID --wait 60`. The adapter requires a recognized positive remaining count in Studio. Check `status JOB_ID` and `watches`. If submission is ambiguous, inspect the asset list and recover only with a confirmed matching asset. Never submit again to find out what happened.
+5. Use `download JOB_ID --format auto --wait 60` to request or retrieve the archived result. Use `inspect-asset FILE` to verify the preserved original and `blender-script JOB_ID` to prepare a standalone Blender import. In Unity, use an offered FBX or an existing GLB importer and verify scale and materials after import.
+
+MCP equivalents are `workbench_prepare_feature`, `workbench_browser_run`, `workbench_browser_inspect`, `workbench_submit`, `workbench_status`, `workbench_download`, and `workbench_inspect_asset`. Use `workbench_browser_result` with queued request IDs. Global requires a separate submit call.
+
+Pass `--root PATH` before the subcommand or set `HUNYUAN_WORKBENCH_ROOT` to relocate state and archived assets. Use separate roots for the two sites. Set `HUNYUAN_CHROME_EXECUTABLE` if Chrome lives outside its standard location. For sign-in or verification, complete the step manually in the worker's dedicated Chrome window.
+
+## Upstream China documentation
+
+The examples and capability claims below describe the China site. Set `HUNYUAN_WORKBENCH_SITE=china` to use them.
+
+### 混元 3D 网页工作台 CLI / MCP
 
 **把参考图和模型交给本地命令，连续完成上传、生成提交、任务监控和成品下载。**
 

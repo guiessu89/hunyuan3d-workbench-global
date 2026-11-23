@@ -31,7 +31,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: 运行离线测试（不连接混元账号）
-        run: python -m unittest test_workbench test_lifecycle -v
+        run: python -m unittest discover -v
+      - name: Verify PowerShell installer without editing MCP host configurations
+        run: ./scripts/install-windows.ps1 -McpHost none
       - name: 构建 wheel 和源码包
         run: python -m build
       - name: 在独立环境验证 wheel
@@ -46,3 +48,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $py smoke_mcp.py --installed
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Verify installer and installed MCP without editing host configurations
+        run: bash scripts/install-macos.sh none
+      - name: Install Chrome if missing
+        run: |
+          if [ ! -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then
+            .venv/bin/python -m playwright install chrome
+          fi
+      - name: Run offline tests
+        run: .venv/bin/python -m unittest discover -v

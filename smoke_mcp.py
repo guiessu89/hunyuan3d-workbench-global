@@ -14,7 +14,8 @@ async def main():
     parser.add_argument('--output', type=Path, help='Optional JSON report path')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='hunyuan-mcp-smoke-') as state_root:
-        child_args = ['-I', '-m', 'hunyuan_workbench', 'mcp'] if args.installed else [str(Path(__file__).with_name('hunyuan_workbench.py')), 'mcp']
+        child_args = ['-I', '-m', 'hunyuan_workbench'] if args.installed else [str(Path(__file__).with_name('hunyuan_workbench.py'))]
+        child_args += ['--site', 'global', 'mcp']
         params=StdioServerParameters(command=sys.executable,args=child_args,
                                     env={**os.environ,'HUNYUAN_WORKBENCH_ROOT':state_root})
         async with stdio_client(params) as (read,write):
@@ -24,11 +25,18 @@ async def main():
                 names = {tool.name for tool in tools.tools}
                 required = {'workbench_capabilities', 'workbench_prepare', 'workbench_prepare_feature',
                             'workbench_browser_start', 'workbench_browser_run', 'workbench_submit',
-                            'workbench_status', 'workbench_watch', 'workbench_download', 'workbench_recover'}
-                if len(tools.tools) != 19 or not required.issubset(names):
-                    raise RuntimeError('MCP tool catalog does not match the expected 19-tool release')
+                            'workbench_status', 'workbench_watch', 'workbench_download', 'workbench_recover',
+                            'workbench_inspect_asset'}
+                if len(tools.tools) != 20 or not required.issubset(names):
+                    raise RuntimeError('MCP tool catalog does not match the expected release')
+                schemas = {tool.name: tool.inputSchema for tool in tools.tools}
+                if schemas['workbench_browser_run']['properties']['submit']['default'] is not False:
+                    raise RuntimeError('Browser preparation must default to no submission')
+                if schemas['workbench_submit'].get('required') != ['job_id']:
+                    raise RuntimeError('Submission must require an explicit job id')
                 result=await session.call_tool('workbench_capabilities',{})
-                if result.isError:raise RuntimeError('Capabilities call failed')
+                if result.isError or json.loads(result.content[0].text).get('site') != 'global':
+                    raise RuntimeError('Global capabilities call failed')
                 report={'initialized':True,'tool_count':len(tools.tools),'tools':[t.name for t in tools.tools],'capabilities_call_ok':True}
                 if args.output:
                     args.output.parent.mkdir(parents=True, exist_ok=True)

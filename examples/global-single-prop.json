@@ -1,0 +1,8 @@
+{
+  "feature": "geometry",
+  "name": "Stone lantern",
+  "mode": "single",
+  "image": "/absolute/path/to/stone-lantern.png",
+  "face_count": 50000,
+  "height_m": 0.45
+}

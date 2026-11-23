@@ -70,9 +70,9 @@ class StudioLifecycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.pw=sync_playwright().start()
-        cls.browser=cls.pw.chromium.launch(channel='chrome',headless=True,chromium_sandbox=True)
-    @classmethod
-    def tearDownClass(cls):cls.browser.close();cls.pw.stop()
+        cls.addClassCleanup(cls.pw.stop)
+        cls.browser=ledger_fixtures.launch_fixture_browser(cls.pw)
+        cls.addClassCleanup(cls.browser.close)
     def page(self,html):
         context=self.browser.new_context()
         context.route('**/*',lambda r:r.fulfill(content_type='text/html',body='<meta charset="utf-8">'+html))
@@ -92,7 +92,7 @@ class StudioLifecycleTests(unittest.TestCase):
         self.assertNotIn('thumbnail',lc.read_binding(flow,jid))
         page.locator('#new img').evaluate("e=>e.src='https://example.test/new.png'")
         self.assertEqual(lc.tick(flow,jid)['state'],'SUCCEEDED')
-        fresh_flow=BrowserFlow(page,Workbench(self.core.root))
+        fresh_flow=BrowserFlow(page,Workbench(self.core.root, site="china"))
         handle,binding=lc.resolve_card(fresh_flow,jid)
         self.assertEqual(binding['thumbnail'],'https://example.test/new.png')
         self.assertEqual(handle.get_attribute('id'),'new')

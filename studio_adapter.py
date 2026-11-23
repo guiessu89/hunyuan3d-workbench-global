@@ -105,18 +105,26 @@ def download_current(flow, format_name="glb", job_id=None):
     if format_name not in {"auto", "glb", "fbx", "stl", "usdz", "mp4", "gif"}:
         raise ValueError("Unsupported observed export format")
     flow.guard()
-    button=flow.page.get_by_role("button",name="下载",exact=True)
-    if not any(flow.page.get_by_text(f,exact=True).is_visible() for f in ('glb','fbx','stl')):
+    button=flow.page.get_by_role("button",name="Download" if flow.core.site.name == "global" else "下载",exact=True)
+    import re
+    def export_item(fmt):
+        if flow.core.site.name == 'global':
+            return flow.page.get_by_text(re.compile(r'^'+fmt+r'$', re.I)).filter(visible=True)
+        return flow.page.get_by_text(fmt, exact=True)
+    if not any(export_item(f).is_visible() for f in ('glb','fbx','stl')):
         button.click(timeout=5000)
-    flow.page.get_by_text('fbx',exact=True).wait_for(state='visible',timeout=5000)
-    available=[f for f in ('glb','fbx','stl','usdz','mp4','gif') if flow.page.get_by_text(f,exact=True).is_visible()]
+    if flow.core.site.name == 'global':
+        flow.page.get_by_text(re.compile(r'^(glb|fbx|stl|usdz|mp4|gif)$', re.I)).filter(visible=True).first.wait_for(timeout=5000)
+    else:
+        flow.page.get_by_text('fbx',exact=True).wait_for(state='visible',timeout=5000)
+    available=[f for f in ('glb','fbx','stl','usdz','mp4','gif') if export_item(f).is_visible()]
     if format_name=='auto':
         # STL is appropriate only for raw geometry; never silently discard textures/rigs.
         feature=flow.core.get(job_id).get('feature','geometry') if job_id else None
-        preferred=('glb','stl','fbx') if feature=='geometry' else ('glb','fbx')
+        preferred = ('glb','fbx','stl') if flow.core.site.name == 'global' else (('glb','stl','fbx') if feature=='geometry' else ('glb','fbx'))
         format_name=next((f for f in preferred if f in available),None)
     if format_name not in available: raise ValueError('Format unavailable for this asset. Available: '+', '.join(available))
-    item = flow.page.get_by_text(format_name, exact=True)
+    item = export_item(format_name)
     flow.status("DOWNLOADING", format_name)
     folder = flow.core.root / "downloads"
     folder.mkdir(exist_ok=True)
@@ -143,6 +151,16 @@ def download_current(flow, format_name="glb", job_id=None):
 
 def dispatch(flow, request, job_id=None):
     action = request.get("action")
+    if flow.core.site.name == 'global':
+        from global_adapter import prepare, submit
+        if action == 'run':
+            if request.get('submit'):
+                raise ValueError('Global requires separate form preparation and explicit submit')
+            return prepare(flow, flow.core.get(job_id))
+        if action in {'submit', 'submit_and_watch'}:
+            return submit(flow, job_id)
+        if action not in {'close_page', 'cards', 'adopt_completed', 'status', 'download_job', 'watch'}:
+            raise ValueError('UNVERIFIED_WORKFLOW: this Studio action has no Global adapter')
     if action=='close_page':
         flow.page.close()
         return {'closed':True,'job_id':job_id}
